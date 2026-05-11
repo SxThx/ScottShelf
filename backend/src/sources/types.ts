@@ -76,5 +76,6 @@ export interface MangaSource {
   search(options: SearchOptions): Promise<MangaSummary[]>;
   getManga(id: string): Promise<MangaDetail>;
   getChapters(mangaId: string, language: string): Promise<ChapterSummary[]>;
+  getChapterPreview?(mangaId: string, language: string): Promise<ChapterSummary[]>;
   getChapterPages(chapterId: string): Promise<ChapterPages>;
 }

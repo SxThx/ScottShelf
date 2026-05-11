@@ -2804,12 +2804,23 @@ function DetailView({
 
   useEffect(() => {
     let cancelled = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     setChapters([]);
     setChaptersError("");
     setChaptersLoading(true);
     fetchChapters(source, id)
       .then((chapterResult) => {
-        if (!cancelled) setChapters(chapterResult.chapters);
+        if (cancelled) return;
+        setChapters(chapterResult.chapters);
+        if (source === "comix" && chapterResult.chapters.length === 20) {
+          refreshTimer = setTimeout(() => {
+            fetchChapters(source, id)
+              .then((refreshed) => {
+                if (!cancelled && refreshed.chapters.length > chapterResult.chapters.length) setChapters(refreshed.chapters);
+              })
+              .catch(() => undefined);
+          }, 20000);
+        }
       })
       .catch((err: Error) => {
         if (!cancelled) setChaptersError(err.message);
@@ -2819,6 +2830,7 @@ function DetailView({
       });
     return () => {
       cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
     };
   }, [source, id]);
 

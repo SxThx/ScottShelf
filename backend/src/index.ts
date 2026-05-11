@@ -300,6 +300,13 @@ async function cachedChapters(source: MangaSource, id: string, language: string)
     return persistent.chapters;
   }
 
+  if (source.getChapterPreview) {
+    refreshChapterListCache(source, id, language);
+    return source.getChapterPreview(id, language).catch(() =>
+      cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language))
+    );
+  }
+
   return cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language));
 }
 

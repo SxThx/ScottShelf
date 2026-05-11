@@ -19,6 +19,7 @@ const API_BASE = "https://comix.to/api/v1";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 ScottShelf/0.1";
 const CHAPTER_LIST_LIMIT = 20;
+const CHAPTER_PAGE_CONCURRENCY = Math.max(1, Math.min(24, Number(process.env.COMIX_CHAPTER_PAGE_CONCURRENCY ?? 12) || 12));
 const SIGNED_URL_TTL_MS = 1000 * 60 * 45;
 const execFileAsync = promisify(execFile);
 
@@ -526,6 +527,20 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function collectUrls(value: unknown) {
   const urls = new Set<string>();
   const stack = [value];
@@ -896,7 +911,7 @@ const renderedChapterExtractExpression = String.raw`
 })()
 `;
 
-function browserChapterApiExpression(hid: string) {
+function browserChapterApiExpression(hid: string, maxPages = 75) {
   return String.raw`
 (async () => {
   if (document.readyState === "loading") {
@@ -918,11 +933,12 @@ function browserChapterApiExpression(hid: string) {
   if (!mainScript) throw new Error("Comix.to app module was not found.");
 
   const app = await import(mainScript);
-  const api = app.M ?? (app.N?.get ? { get: async (...args) => (await app.N.get(...args)).data } : undefined);
+  const api = app.L?.get ? app.L : app.M?.get ? app.M : app.N?.get ? { get: async (...args) => (await app.N.get(...args)).data } : undefined;
   if (!api?.get) throw new Error("Comix.to app API client was not found.");
 
   const hid = ${JSON.stringify(hid)};
   const limit = ${CHAPTER_LIST_LIMIT};
+  const concurrency = ${CHAPTER_PAGE_CONCURRENCY};
   const query = (page) => ({
     page,
     limit,
@@ -959,14 +975,25 @@ function browserChapterApiExpression(hid: string) {
     const page = Number(meta?.lastPage || pagination?.last_page || (total ? Math.ceil(total / limit) : 1));
     return Number.isFinite(page) && page > 0 ? page : 1;
   };
+  const mapWithConcurrency = async (items, mapper) => {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index], index);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  };
 
   const load = (page) => api.get("/manga/" + hid + "/chapters", { params: query(page) });
   const first = await load(1);
-  const pages = [first];
-  const pageCount = Math.min(lastPage(first), 75);
-  for (let page = 2; page <= pageCount; page += 1) {
-    pages.push(await load(page));
-  }
+  const pageCount = Math.min(lastPage(first), ${maxPages});
+  const pageNumbers = Array.from({ length: Math.max(0, pageCount - 1) }, (_value, index) => index + 2);
+  const pages = [first, ...(await mapWithConcurrency(pageNumbers, (page) => load(page)))];
   return pages.flatMap(itemList);
 })()
 `;
@@ -1031,7 +1058,7 @@ function browserChapterPagesExpression(chapterId: string) {
     const mainScript = await waitForMainScript();
     if (mainScript) {
       const app = await import(mainScript);
-      const api = app.M ?? (app.N?.get ? { get: async (...args) => (await app.N.get(...args)).data } : undefined);
+      const api = app.L?.get ? app.L : app.M?.get ? app.M : app.N?.get ? { get: async (...args) => (await app.N.get(...args)).data } : undefined;
       if (api?.get) {
         const unwrap = (value) => {
           let current = value;
@@ -1104,14 +1131,26 @@ async function waitForRenderedChapters(client: CdpWebSocket, previousFirstHref?:
 }
 
 async function getRenderedChapters(mangaId: string, language: string): Promise<ChapterSummary[]> {
+  const timingEnabled = process.env.CHAPTER_TIMING === "1";
+  const startedAt = Date.now();
+  const logTiming = (step: string, extra = "") => {
+    if (!timingEnabled) return;
+    console.log(`[comix-rendered-chapter-timing] ${mangaId}:${language} ${step} ${Date.now() - startedAt}ms${extra ? ` ${extra}` : ""}`);
+  };
+
   const pageUrl = titleUrl(mangaId);
   const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  logTiming("launch");
   try {
     const browserApiChapters = await evaluateInBrowser<ComixChapter[]>(
       client,
       browserChapterApiExpression(hashFromId(mangaId)),
       45000
-    ).catch(() => []);
+    ).catch((error) => {
+      logTiming("browser-api-error", error instanceof Error ? error.message : String(error));
+      return [];
+    });
+    logTiming("browser-api", `chapters=${browserApiChapters.length}`);
     if (browserApiChapters.length) {
       return browserApiChapters
         .filter((chapter) => !language || chapter.language === language)
@@ -1121,6 +1160,7 @@ async function getRenderedChapters(mangaId: string, language: string): Promise<C
     const chapters = new Map<string, ChapterSummary>();
     let current = await waitForRenderedChapters(client);
     const pageCount = Math.min(Math.max(1, Math.ceil((current.total || current.rows.length) / CHAPTER_LIST_LIMIT)), 75);
+    logTiming("dom-page-1", `rows=${current.rows.length} total=${current.total} pages=${pageCount}`);
 
     for (let page = 1; page <= pageCount; page += 1) {
       for (const row of current.rows) {
@@ -1136,10 +1176,38 @@ async function getRenderedChapters(mangaId: string, language: string): Promise<C
       );
       if (!clicked) break;
       current = await waitForRenderedChapters(client, previousFirstHref);
+      logTiming(`dom-page-${page + 1}`, `rows=${current.rows.length}`);
       if (!current.rows.length) break;
     }
 
+    logTiming("dom-done", `chapters=${chapters.size}`);
     return [...chapters.values()];
+  } finally {
+    client.close();
+    browser.kill();
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function getRenderedChapterPreview(mangaId: string, language: string): Promise<ChapterSummary[]> {
+  const pageUrl = titleUrl(mangaId);
+  const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  try {
+    const browserApiChapters = await evaluateInBrowser<ComixChapter[]>(
+      client,
+      browserChapterApiExpression(hashFromId(mangaId), 1),
+      20000
+    ).catch(() => []);
+    if (browserApiChapters.length) {
+      return browserApiChapters
+        .filter((chapter) => !language || chapter.language === language)
+        .map((chapter) => toChapter(chapter, mangaId));
+    }
+
+    const current = await waitForRenderedChapters(client);
+    return current.rows
+      .map((row) => toRenderedChapter(row, mangaId, language))
+      .filter((chapter): chapter is ChapterSummary => Boolean(chapter));
   } finally {
     client.close();
     browser.kill();
@@ -1450,38 +1518,72 @@ export const comixSource: MangaSource = {
   },
 
   async getChapters(mangaId: string, language: string) {
+    const timingEnabled = process.env.CHAPTER_TIMING === "1";
+    const startedAt = Date.now();
+    const logTiming = (step: string, extra = "") => {
+      if (!timingEnabled) return;
+      console.log(`[comix-chapter-timing] ${mangaId}:${language} ${step} ${Date.now() - startedAt}ms${extra ? ` ${extra}` : ""}`);
+    };
+
     const currentMangaId = await resolveCurrentMangaId(mangaId);
+    logTiming("resolve", `current=${currentMangaId}`);
+    if (process.env.COMIX_CHAPTER_BROWSER_FIRST !== "0") {
+      try {
+        logTiming("browser-first");
+        const chapters = await getRenderedChapters(currentMangaId, language);
+        if (chapters.length) return chapters;
+      } catch (error) {
+        logTiming("browser-first-error", error instanceof Error ? error.message : String(error));
+      }
+    }
+
     const hid = hashFromId(currentMangaId);
     const referer = titleUrl(currentMangaId);
+    const cacheKey = `chapters:${hid}`;
+    const matcher = (url: string) => url.includes(`/api/v1/manga/${hid}/chapters?`);
     let signedUrl: string | undefined;
+    let signedUrlPromise: Promise<string> | undefined;
+    const capturedSignedUrl = async () => {
+      if (signedUrl) return signedUrl;
+      signedUrlPromise ??= captureSignedUrl(cacheKey, referer, matcher);
+      signedUrl = await signedUrlPromise;
+      return signedUrl;
+    };
     const loadPage = async (page: number) => {
+      const pageStartedAt = Date.now();
       try {
-        return await signedRequest<ComixList<ComixChapter>>(`/manga/${hid}/chapters`, chapterListQuery(page));
+        const result = await signedRequest<ComixList<ComixChapter>>(`/manga/${hid}/chapters`, chapterListQuery(page));
+        logTiming(`page-${page}`, `signed=${Date.now() - pageStartedAt}ms items=${comixListItems<ComixChapter>(result).length}`);
+        return result;
       } catch (error) {
-        const cacheKey = `chapters:${hid}`;
-        const matcher = (url: string) => url.includes(`/api/v1/manga/${hid}/chapters?`);
-        signedUrl ??= await captureSignedUrl(cacheKey, referer, matcher);
-        return signedJson<ComixList<ComixChapter>>(signedChapterListUrl(signedUrl, hid, page), referer);
+        const result = await signedJson<ComixList<ComixChapter>>(signedChapterListUrl(await capturedSignedUrl(), hid, page), referer);
+        logTiming(`page-${page}`, `captured=${Date.now() - pageStartedAt}ms items=${comixListItems<ComixChapter>(result).length}`);
+        return result;
       }
     };
 
     const firstPage = await loadPage(1);
     if (isEncryptedPayload(firstPage) || comixListItems<ComixChapter>(firstPage).length === 0) {
+      logTiming("rendered-fallback");
       return getRenderedChapters(currentMangaId, language);
     }
 
     const lastPage = Math.min(comixLastPage(firstPage), 75);
-    const pages = [firstPage];
-
-    for (let page = 2; page <= lastPage; page += 1) {
-      pages.push(await loadPage(page));
-    }
+    logTiming("page-count", `last=${lastPage}`);
+    const pageNumbers = Array.from({ length: Math.max(0, lastPage - 1) }, (_value, index) => index + 2);
+    const pages = [firstPage, ...(await mapWithConcurrency(pageNumbers, CHAPTER_PAGE_CONCURRENCY, (page) => loadPage(page)))];
+    logTiming("pages-loaded", `pages=${pages.length}`);
 
     return pages
       .flatMap((page) => comixListItems<ComixChapter>(page))
       .filter((chapter): chapter is ComixChapter => Boolean(chapter))
       .filter((chapter) => !language || chapter.language === language)
       .map((chapter) => toChapter(chapter, currentMangaId));
+  },
+
+  async getChapterPreview(mangaId: string, language: string) {
+    const currentMangaId = await resolveCurrentMangaId(mangaId);
+    return getRenderedChapterPreview(currentMangaId, language);
   },
 
   async getChapterPages(id: string): Promise<ChapterPages> {
