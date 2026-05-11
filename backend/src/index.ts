@@ -481,23 +481,36 @@ async function mangaWithMirrors(source: MangaSource, id: string) {
 }
 
 async function chaptersWithMirrors(source: MangaSource, id: string, language: string) {
+  const timingEnabled = process.env.CHAPTER_TIMING === "1";
+  const startedAt = Date.now();
+  const logTiming = (step: string, extra = "") => {
+    if (!timingEnabled) return;
+    console.log(`[chapter-timing] ${source.info.id}:${id}:${language} ${step} ${Date.now() - startedAt}ms${extra ? ` ${extra}` : ""}`);
+  };
+
   const primaryError: unknown[] = [];
   const primaryChapters = await cachedChapters(source, id, language).catch((error) => {
     primaryError.push(error);
     return [] as ChapterSummary[];
   });
+  logTiming("primary", `chapters=${primaryChapters.length}`);
+
+  if (primaryChapters.length) {
+    void upsertCanonicalChapters(source.info.id, id, language, primaryChapters).catch(() => undefined);
+    logTiming("done", `chapters=${primaryChapters.length} mirrors=skipped`);
+    return primaryChapters;
+  }
+
   const base = await cachedManga(source, id).catch(() => undefined);
+  logTiming("manga", base ? `title=${JSON.stringify(base.title)}` : "missing");
   if (!base) {
-    if (primaryChapters.length) return primaryChapters;
     const error = primaryError[0];
     if (error instanceof Error) throw error;
     return primaryChapters;
   }
-  if (primaryChapters.length) {
-    void upsertCanonicalChapters(source.info.id, id, language, primaryChapters).catch(() => undefined);
-  }
 
   const mirrors = await discoverMirrors(base, 3).catch(() => []);
+  logTiming("mirrors", `count=${mirrors.length} ids=${mirrors.map((mirror) => `${mirror.source}:${mirror.id}`).join(",")}`);
   const mirrorChapters = await Promise.all(
     mirrors.map(async (mirror) => {
       const mirrorSource = getSource(mirror.source);
@@ -505,6 +518,7 @@ async function chaptersWithMirrors(source: MangaSource, id: string, language: st
       return cachedChapters(mirrorSource, mirror.id, language).catch(() => [] as ChapterSummary[]);
     })
   );
+  logTiming("mirror-chapters", `chapters=${mirrorChapters.flat().length}`);
 
   const seen = new Set<string>();
   const mergedChapters = [...primaryChapters, ...mirrorChapters.flat()].filter((chapter) => {
@@ -513,6 +527,7 @@ async function chaptersWithMirrors(source: MangaSource, id: string, language: st
     seen.add(key);
     return true;
   });
+  logTiming("done", `chapters=${mergedChapters.length}`);
   if (mergedChapters.length) return mergedChapters;
   const error = primaryError[0];
   if (error instanceof Error) throw error;

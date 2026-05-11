@@ -27,6 +27,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4174
+      CHAPTER_TIMING: ${CHAPTER_TIMING:-0}
       MYSQL_HOST: db
       MYSQL_PORT: 3306
       MYSQL_USER: root
