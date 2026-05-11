@@ -816,6 +816,10 @@ async function warmSourceCache() {
     );
     if (detailOk) warmed += 1;
 
+    if (favoriteSource.info.id === "comix" && process.env.CACHE_WARM_COMIX_CHAPTERS !== "1") {
+      continue;
+    }
+
     try {
       const chapters = await withTimeout(
         cachedChapters(favoriteSource, ref.mangaId, "en"),
