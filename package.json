@@ -1,0 +1,18 @@
+{
+  "name": "mangass",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A manga, manhwa, and manhua reader with separate frontend and backend apps.",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "npm --prefix backend run dev",
+    "install:all": "npm install --prefix frontend && npm install --prefix backend",
+    "build": "npm --prefix frontend run build && npm --prefix backend run typecheck && npm --prefix backend run build",
+    "typecheck": "npm --prefix frontend run typecheck && npm --prefix backend run typecheck"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
