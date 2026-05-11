@@ -279,7 +279,7 @@ function chapterListMissingReleaseDates(chapters: ChapterSummary[]) {
   return chapters.length > 0 && !chapters.some((chapter) => chapter.publishedAt || chapter.readableAt);
 }
 
-async function cachedChapters(source: MangaSource, id: string, language: string) {
+async function cachedChapters(source: MangaSource, id: string, language: string, targetChapter?: string) {
   const memoryKey = cacheKey("source.chapters", { source: source.info.id, id, language });
   const persistent = await getChapterListCache(source.info.id, id, language).catch(() => undefined);
   if (persistent?.chapters.length) {
@@ -301,10 +301,13 @@ async function cachedChapters(source: MangaSource, id: string, language: string)
   }
 
   if (source.getChapterPreview) {
-    refreshChapterListCache(source, id, language);
-    return source.getChapterPreview(id, language).catch(() =>
-      cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language))
-    );
+    try {
+      const preview = await source.getChapterPreview(id, language, targetChapter);
+      refreshChapterListCache(source, id, language);
+      return preview;
+    } catch {
+      return cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language));
+    }
   }
 
   return cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language));
@@ -487,7 +490,7 @@ async function mangaWithMirrors(source: MangaSource, id: string) {
   return mirrors.length ? { ...manga, mirrors } : manga;
 }
 
-async function chaptersWithMirrors(source: MangaSource, id: string, language: string) {
+async function chaptersWithMirrors(source: MangaSource, id: string, language: string, targetChapter?: string) {
   const timingEnabled = process.env.CHAPTER_TIMING === "1";
   const startedAt = Date.now();
   const logTiming = (step: string, extra = "") => {
@@ -496,7 +499,7 @@ async function chaptersWithMirrors(source: MangaSource, id: string, language: st
   };
 
   const primaryError: unknown[] = [];
-  const primaryChapters = await cachedChapters(source, id, language).catch((error) => {
+  const primaryChapters = await cachedChapters(source, id, language, targetChapter).catch((error) => {
     primaryError.push(error);
     return [] as ChapterSummary[];
   });
@@ -1419,7 +1422,8 @@ app.get(
   asyncRoute(async (req, res) => {
     const source = sourceOr404(req.params.source);
     const language = typeof req.query.language === "string" ? req.query.language : "en";
-    const chapters = await chaptersWithMirrors(source, req.params.id, language);
+    const targetChapter = typeof req.query.chapterNumber === "string" ? req.query.chapterNumber : undefined;
+    const chapters = await chaptersWithMirrors(source, req.params.id, language, targetChapter);
     publicCache(res, 300);
     res.json({ chapters });
   })

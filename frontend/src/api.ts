@@ -330,10 +330,10 @@ export async function fetchSimilarManga(source: string, id: string) {
   return apiRequest<{ manga: MangaSummary[] }>(`/api/manga/${source}/${id}/similar`);
 }
 
-export async function fetchChapters(source: string, id: string, language = "en") {
-  return apiRequest<{ chapters: ChapterSummary[] }>(
-    `/api/manga/${source}/${id}/chapters?${new URLSearchParams({ language })}`
-  );
+export async function fetchChapters(source: string, id: string, language = "en", chapterNumber?: string) {
+  const params = new URLSearchParams({ language });
+  if (chapterNumber) params.set("chapterNumber", chapterNumber);
+  return apiRequest<{ chapters: ChapterSummary[] }>(`/api/manga/${source}/${id}/chapters?${params}`);
 }
 
 export async function fetchChapterPages(source: string, id: string, mangaId?: string, chapterNumber?: string, language = "en") {

@@ -2808,13 +2808,24 @@ function DetailView({
     setChapters([]);
     setChaptersError("");
     setChaptersLoading(true);
-    fetchChapters(source, id)
+    const chapterHintBookmark =
+      favorites.find((item) => item.source === source && item.id === id) ??
+      (manga?.canonicalKey ? favorites.find((item) => item.canonicalKey === manga.canonicalKey) : undefined);
+    const chapterHintProgress =
+      readingProgress.find((item) => item.source === source && item.mangaId === id) ??
+      (manga?.canonicalKey ? readingProgress.find((item) => item.canonicalKey === manga.canonicalKey) : undefined);
+    const chapterHint =
+      chapterHintBookmark?.lastReadChapter ??
+      chapterHintProgress?.chapterNumber ??
+      chapterHintBookmark?.lastReadChapterId ??
+      chapterHintProgress?.chapterId;
+    fetchChapters(source, id, "en", chapterHint)
       .then((chapterResult) => {
         if (cancelled) return;
         setChapters(chapterResult.chapters);
-        if (source === "comix" && chapterResult.chapters.length === 20) {
+        if (source === "comix" && chapterResult.chapters.length > 0 && chapterResult.chapters.length <= 60) {
           refreshTimer = setTimeout(() => {
-            fetchChapters(source, id)
+            fetchChapters(source, id, "en", chapterHint)
               .then((refreshed) => {
                 if (!cancelled && refreshed.chapters.length > chapterResult.chapters.length) setChapters(refreshed.chapters);
               })
@@ -2832,7 +2843,7 @@ function DetailView({
       cancelled = true;
       if (refreshTimer) clearTimeout(refreshTimer);
     };
-  }, [source, id]);
+  }, [source, id, manga?.canonicalKey, favorites, readingProgress]);
 
   const chapterGroups = useMemo(() => sortChapterGroups(groupChaptersByNumber(chapters), chapterSort), [chapters, chapterSort]);
 

@@ -482,6 +482,25 @@ async function requestHtml(path: string) {
 
 let chromePathPromise: Promise<string> | undefined;
 const signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+const renderedBrowserQueue: Array<() => void> = [];
+let activeRenderedBrowsers = 0;
+
+async function acquireRenderedBrowserSlot() {
+  const limit = Math.max(1, Math.min(3, Number(process.env.COMIX_RENDERED_BROWSER_CONCURRENCY ?? 1) || 1));
+  if (activeRenderedBrowsers < limit) {
+    activeRenderedBrowsers += 1;
+    return () => releaseRenderedBrowserSlot();
+  }
+
+  await new Promise<void>((resolve) => renderedBrowserQueue.push(resolve));
+  activeRenderedBrowsers += 1;
+  return () => releaseRenderedBrowserSlot();
+}
+
+function releaseRenderedBrowserSlot() {
+  activeRenderedBrowsers = Math.max(0, activeRenderedBrowsers - 1);
+  renderedBrowserQueue.shift()?.();
+}
 
 async function fileExists(filePath: string) {
   try {
@@ -999,6 +1018,82 @@ function browserChapterApiExpression(hid: string, maxPages = 75) {
 `;
 }
 
+function browserChapterPreviewExpression(hid: string, targetChapter?: string) {
+  return String.raw`
+(async () => {
+  if (document.readyState === "loading") {
+    await new Promise((resolve) => document.addEventListener("DOMContentLoaded", resolve, { once: true }));
+  }
+
+  const waitForMainScript = async () => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 15000) {
+      const mainScript = [...document.querySelectorAll('script[src]')]
+        .map((script) => script.src)
+        .find((src) => src.includes("/assets/build/") && src.includes("/dist/main-"));
+      if (mainScript) return mainScript;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return "";
+  };
+  const mainScript = await waitForMainScript();
+  if (!mainScript) throw new Error("Comix.to app module was not found.");
+
+  const app = await import(mainScript);
+  const api = app.L?.get ? app.L : app.M?.get ? app.M : app.N?.get ? { get: async (...args) => (await app.N.get(...args)).data } : undefined;
+  if (!api?.get) throw new Error("Comix.to app API client was not found.");
+
+  const hid = ${JSON.stringify(hid)};
+  const target = Number(${JSON.stringify(targetChapter ?? "")});
+  const limit = ${CHAPTER_LIST_LIMIT};
+  const unwrap = (value) => {
+    let current = value;
+    for (let depth = 0; depth < 5; depth += 1) {
+      if (!current || typeof current !== "object") break;
+      if ("result" in current) {
+        current = current.result;
+        continue;
+      }
+      if ("data" in current && !Array.isArray(current.items)) {
+        current = current.data;
+        continue;
+      }
+      break;
+    }
+    return current;
+  };
+  const itemList = (value) => {
+    const current = unwrap(value);
+    if (Array.isArray(current)) return current;
+    if (Array.isArray(current?.items)) return current.items;
+    if (Array.isArray(current?.data)) return current.data;
+    return [];
+  };
+  const load = (page, order) => api.get("/manga/" + hid + "/chapters", {
+    params: { page, limit, "order[number]": order }
+  });
+  const pages = await Promise.all([load(1, "desc"), load(1, "asc")]);
+  const newest = itemList(pages[0]);
+  if (Number.isFinite(target) && target > 0 && !pages.flatMap(itemList).some((chapter) => Number(chapter?.number) === target)) {
+    const latest = Math.max(0, ...newest.map((chapter) => Number(chapter?.number)).filter(Number.isFinite));
+    const uniqueNewestChapters = new Set(newest.map((chapter) => Number(chapter?.number)).filter(Number.isFinite)).size;
+    const chaptersPerPage = uniqueNewestChapters || limit;
+    const targetPage = latest > 0 ? Math.floor(Math.max(0, latest - target) / chaptersPerPage) + 1 : 0;
+    const targetPages = [targetPage, targetPage + 1].filter((page) => page > 1);
+    pages.push(...(await Promise.all([...new Set(targetPages)].map((page) => load(page, "desc")))));
+  }
+
+  const seen = new Set();
+  return pages.flatMap(itemList).filter((chapter) => {
+    const key = String(chapter?.id ?? chapter?.chapter_id ?? chapter?.number ?? "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+})()
+`;
+}
+
 function browserChapterPagesExpression(chapterId: string) {
   return String.raw`
 (async () => {
@@ -1098,6 +1193,7 @@ function browserChapterPagesExpression(chapterId: string) {
 }
 
 async function launchRenderedComixPage(pageUrl: string) {
+  const releaseBrowserSlot = await acquireRenderedBrowserSlot();
   const browserPath = await chromePath();
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "scottshelf-comix-render-"));
   const browserTempDir = await pathForBrowser(tempDir, browserPath);
@@ -1111,10 +1207,11 @@ async function launchRenderedComixPage(pageUrl: string) {
     await client.command("Page.enable");
     await client.command("Runtime.enable");
     await client.command("Page.navigate", { url: pageUrl }).catch(() => undefined);
-    return { browser, client, tempDir };
+    return { browser, client, tempDir, releaseBrowserSlot };
   } catch (error) {
     browser.kill();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    releaseBrowserSlot();
     throw error;
   }
 }
@@ -1139,7 +1236,7 @@ async function getRenderedChapters(mangaId: string, language: string): Promise<C
   };
 
   const pageUrl = titleUrl(mangaId);
-  const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  const { browser, client, tempDir, releaseBrowserSlot } = await launchRenderedComixPage(pageUrl);
   logTiming("launch");
   try {
     const browserApiChapters = await evaluateInBrowser<ComixChapter[]>(
@@ -1186,16 +1283,17 @@ async function getRenderedChapters(mangaId: string, language: string): Promise<C
     client.close();
     browser.kill();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    releaseBrowserSlot();
   }
 }
 
-async function getRenderedChapterPreview(mangaId: string, language: string): Promise<ChapterSummary[]> {
+async function getRenderedChapterPreview(mangaId: string, language: string, targetChapter?: string): Promise<ChapterSummary[]> {
   const pageUrl = titleUrl(mangaId);
-  const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  const { browser, client, tempDir, releaseBrowserSlot } = await launchRenderedComixPage(pageUrl);
   try {
     const browserApiChapters = await evaluateInBrowser<ComixChapter[]>(
       client,
-      browserChapterApiExpression(hashFromId(mangaId), 1),
+      browserChapterPreviewExpression(hashFromId(mangaId), targetChapter),
       20000
     ).catch(() => []);
     if (browserApiChapters.length) {
@@ -1212,12 +1310,13 @@ async function getRenderedChapterPreview(mangaId: string, language: string): Pro
     client.close();
     browser.kill();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    releaseBrowserSlot();
   }
 }
 
 async function getBrowserChapterPages(id: string, mangaId: string, chapterId: string, chapterNumber: string): Promise<ChapterPages> {
   const pageUrl = chapterPageUrl(mangaId, chapterId, chapterNumber);
-  const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  const { browser, client, tempDir, releaseBrowserSlot } = await launchRenderedComixPage(pageUrl);
   try {
     const pages = await evaluateInBrowser<string[]>(client, browserChapterPagesExpression(chapterId), 45000);
     if (!pages.length) throw new Error("Comix.to did not return chapter pages.");
@@ -1230,6 +1329,7 @@ async function getBrowserChapterPages(id: string, mangaId: string, chapterId: st
     client.close();
     browser.kill();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    releaseBrowserSlot();
   }
 }
 
@@ -1237,7 +1337,7 @@ async function captureSignedUrl(cacheKey: string, pageUrl: string, matcher: (url
   const cached = signedUrlCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.url;
 
-  const { browser, client, tempDir } = await launchRenderedComixPage(pageUrl);
+  const { browser, client, tempDir, releaseBrowserSlot } = await launchRenderedComixPage(pageUrl);
   try {
     const inspectUrl = (url: unknown, resolve: (url: string) => void) => {
       if (typeof url === "string" && url.startsWith(API_BASE) && matcher(url)) resolve(url);
@@ -1276,6 +1376,7 @@ async function captureSignedUrl(cacheKey: string, pageUrl: string, matcher: (url
     client.close();
     browser.kill();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    releaseBrowserSlot();
   }
 }
 
@@ -1581,9 +1682,9 @@ export const comixSource: MangaSource = {
       .map((chapter) => toChapter(chapter, currentMangaId));
   },
 
-  async getChapterPreview(mangaId: string, language: string) {
+  async getChapterPreview(mangaId: string, language: string, targetChapter?: string) {
     const currentMangaId = await resolveCurrentMangaId(mangaId);
-    return getRenderedChapterPreview(currentMangaId, language);
+    return getRenderedChapterPreview(currentMangaId, language, targetChapter);
   },
 
   async getChapterPages(id: string): Promise<ChapterPages> {
