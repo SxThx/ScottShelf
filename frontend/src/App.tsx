@@ -884,6 +884,33 @@ function displayedChapterCount(chapters: ChapterSummary[]) {
   return highestChapter || groupChaptersByNumber(chapters).length;
 }
 
+function chapterRangeSummary(chapters: ChapterSummary[]) {
+  const values = [
+    ...new Set(
+      chapters
+        .map((chapter) => chapterNumberValue(chapter.chapter))
+        .filter((value): value is number => value !== undefined && Number.isInteger(value))
+        .sort((left, right) => left - right)
+    )
+  ];
+  if (!values.length) return "";
+
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (const value of values) {
+    const current = ranges[ranges.length - 1];
+    if (current && value === current.end + 1) {
+      current.end = value;
+    } else {
+      ranges.push({ start: value, end: value });
+    }
+  }
+
+  return ranges
+    .slice(0, 4)
+    .map((range) => (range.start === range.end ? `Ch. ${range.start}` : `Ch. ${range.start}-${range.end}`))
+    .join(", ");
+}
+
 function compactChapterLabel(label?: string) {
   return label?.replace(/^Ch\.\s*/i, "") ?? "";
 }
@@ -2764,6 +2791,7 @@ function DetailView({
   const [error, setError] = useState("");
   const [chaptersLoading, setChaptersLoading] = useState(true);
   const [chaptersError, setChaptersError] = useState("");
+  const [chapterRefreshPending, setChapterRefreshPending] = useState(false);
   const [synopsisExpanded, setSynopsisExpanded] = useState(false);
   const [altTitlesExpanded, setAltTitlesExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
@@ -2807,6 +2835,7 @@ function DetailView({
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     setChapters([]);
     setChaptersError("");
+    setChapterRefreshPending(false);
     setChaptersLoading(true);
     const chapterHintBookmark =
       favorites.find((item) => item.source === source && item.id === id) ??
@@ -2824,12 +2853,17 @@ function DetailView({
         if (cancelled) return;
         setChapters(chapterResult.chapters);
         if (source === "comix" && chapterResult.chapters.length > 0 && chapterResult.chapters.length <= 60) {
+          setChapterRefreshPending(true);
           refreshTimer = setTimeout(() => {
             fetchChapters(source, id, "en", chapterHint)
               .then((refreshed) => {
-                if (!cancelled && refreshed.chapters.length > chapterResult.chapters.length) setChapters(refreshed.chapters);
+                if (cancelled) return;
+                if (refreshed.chapters.length > chapterResult.chapters.length) setChapters(refreshed.chapters);
+                setChapterRefreshPending(false);
               })
-              .catch(() => undefined);
+              .catch(() => {
+                if (!cancelled) setChapterRefreshPending(false);
+              });
           }, 20000);
         }
       })
@@ -2846,6 +2880,7 @@ function DetailView({
   }, [source, id, manga?.canonicalKey, favorites, readingProgress]);
 
   const chapterGroups = useMemo(() => sortChapterGroups(groupChaptersByNumber(chapters), chapterSort), [chapters, chapterSort]);
+  const previewChapterSummary = useMemo(() => chapterRangeSummary(chapters), [chapters]);
 
 	  useEffect(() => {
 	    setSynopsisExpanded(false);
@@ -3221,6 +3256,15 @@ function DetailView({
         </div>
         {chaptersError && <div className="notice error">Chapter list could not be loaded: {chaptersError}</div>}
         {chaptersLoading && <LoadingNotice label="Loading chapters" />}
+        {!chaptersLoading && !chaptersError && chapterRefreshPending && (
+          <div className="chapter-refresh-status" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span>
+              Loading full chapter list
+              {previewChapterSummary ? `, currently showing ${previewChapterSummary}` : ""}
+            </span>
+          </div>
+        )}
         {!chaptersLoading && !chaptersError && <ChapterPagination />}
 	        <div className="chapter-table">
 	          {!chaptersLoading && !chaptersError && visibleChapterGroups.map((group) => {
