@@ -382,6 +382,60 @@ function uniqueText(values: Array<string | undefined>) {
   return result;
 }
 
+const englishTitleWords = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "beginning",
+  "by",
+  "for",
+  "from",
+  "global",
+  "hero",
+  "in",
+  "is",
+  "lord",
+  "my",
+  "of",
+  "on",
+  "superpowers",
+  "the",
+  "to",
+  "with"
+]);
+
+function titleEnglishScore(title?: string) {
+  const trimmed = title?.trim();
+  if (!trimmed) return 0;
+  if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(trimmed)) return 0;
+
+  const words = trimmed.toLowerCase().match(/[a-z][a-z']*/g) ?? [];
+  if (words.length < 2) return 0;
+
+  const letters = trimmed.match(/\p{L}/gu) ?? [];
+  const latinLetters = trimmed.match(/[a-z]/gi) ?? [];
+  if (letters.length > 0 && latinLetters.length / letters.length < 0.9) return 0;
+
+  const commonWords = words.filter((word) => englishTitleWords.has(word)).length;
+  if (commonWords === 0) return 0;
+
+  return commonWords * 4 + Math.min(words.length, 12) + (trimmed.includes(":") ? 2 : 0);
+}
+
+function preferredTitleFromAlternates(manga: MangaDetail) {
+  const currentScore = titleEnglishScore(manga.title);
+  const alternate = uniqueText(manga.altTitles)
+    .filter((title) => title.toLowerCase() !== manga.title.trim().toLowerCase())
+    .map((title) => ({ title, score: titleEnglishScore(title) }))
+    .find((candidate) => candidate.score > currentScore);
+
+  return alternate?.title ?? manga.title;
+}
+
 function mangaGenres(manga: MangaSummary) {
   const categories = new Set(uniqueText(manga.categories ?? []).map((tag) => tag.toLowerCase()));
   return uniqueText(manga.genres ?? []).filter((tag) => !categories.has(tag.toLowerCase()));
@@ -882,6 +936,11 @@ function displayedChapterCount(chapters: ChapterSummary[]) {
   );
 
   return highestChapter || groupChaptersByNumber(chapters).length;
+}
+
+function chapterListLooksPartial(chapters: ChapterSummary[]) {
+  if (!chapters.length) return false;
+  return displayedChapterCount(chapters) > groupChaptersByNumber(chapters).length;
 }
 
 function chapterRangeSummary(chapters: ChapterSummary[]) {
@@ -2833,6 +2892,7 @@ function DetailView({
   useEffect(() => {
     let cancelled = false;
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshDelayMs = 15000;
     setChapters([]);
     setChaptersError("");
     setChapterRefreshPending(false);
@@ -2848,24 +2908,31 @@ function DetailView({
       chapterHintProgress?.chapterNumber ??
       chapterHintBookmark?.lastReadChapterId ??
       chapterHintProgress?.chapterId;
+
+    const scheduleRefresh = (currentChapters: ChapterSummary[]) => {
+      setChapterRefreshPending(true);
+      refreshTimer = setTimeout(() => {
+        fetchChapters(source, id, "en", chapterHint)
+          .then((refreshed) => {
+            if (cancelled) return;
+            if (refreshed.chapters.length >= currentChapters.length) setChapters(refreshed.chapters);
+            if (source === "comix" && chapterListLooksPartial(refreshed.chapters)) {
+              scheduleRefresh(refreshed.chapters);
+              return;
+            }
+            setChapterRefreshPending(false);
+          })
+          .catch(() => {
+            if (!cancelled) setChapterRefreshPending(false);
+          });
+      }, refreshDelayMs);
+    };
+
     fetchChapters(source, id, "en", chapterHint)
       .then((chapterResult) => {
         if (cancelled) return;
         setChapters(chapterResult.chapters);
-        if (source === "comix" && chapterResult.chapters.length > 0 && chapterResult.chapters.length <= 60) {
-          setChapterRefreshPending(true);
-          refreshTimer = setTimeout(() => {
-            fetchChapters(source, id, "en", chapterHint)
-              .then((refreshed) => {
-                if (cancelled) return;
-                if (refreshed.chapters.length > chapterResult.chapters.length) setChapters(refreshed.chapters);
-                setChapterRefreshPending(false);
-              })
-              .catch(() => {
-                if (!cancelled) setChapterRefreshPending(false);
-              });
-          }, 20000);
-        }
+        if (source === "comix" && chapterListLooksPartial(chapterResult.chapters)) scheduleRefresh(chapterResult.chapters);
       })
       .catch((err: Error) => {
         if (!cancelled) setChaptersError(err.message);
@@ -2981,7 +3048,8 @@ function DetailView({
   const readTarget = lastReadChapter ?? firstChapter;
   const readLabel = lastReadChapter ? `Continue ${formatChapter(lastReadChapter)}` : "Start reading";
   const readScrollPosition = lastReadChapter ? bookmark?.lastReadScrollPosition ?? progress?.scrollPosition : undefined;
-  const otherNames = manga.altTitles.filter((title) => title && title !== manga.title).slice(0, 8);
+  const displayTitle = preferredTitleFromAlternates(manga);
+  const otherNames = uniqueText([manga.title, ...manga.altTitles]).filter((title) => title !== displayTitle).slice(0, 8);
   const genres = mangaGenres(manga);
   const categoryTags = mangaCategoryTags(manga);
   const metadataUrl = metadataSourceUrl(manga);
@@ -3087,7 +3155,7 @@ function DetailView({
         <div className="modal-backdrop" role="presentation">
           <form className="confirm-modal share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title" onSubmit={submitShare}>
             <h2 id="share-title">Share title</h2>
-            <p>Recommend "{manga.title}" to another user.</p>
+            <p>Recommend "{displayTitle}" to another user.</p>
             {shareError && <div className="notice error share-notice">{shareError}</div>}
             <label className="form-field">
               <span>Recommend to</span>
@@ -3159,7 +3227,7 @@ function DetailView({
         </aside>
 
         <article className="title-info">
-          <h1>{manga.title}</h1>
+          <h1>{displayTitle}</h1>
           <TitleRating manga={manga} />
           {otherNames.length > 0 && (
             <section className="title-detail-section known-names-block">
