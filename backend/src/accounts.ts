@@ -1456,7 +1456,7 @@ export async function enqueueBookmarkDownloadsForAll(limit = 500) {
 export async function enqueueChapterPageDownloadJobsForChapters(
   ref: { source: string; mangaId: string; canonicalKey?: string; language?: string },
   chapters: ChapterSummary[],
-  priority = 1
+  priority = 50
 ) {
   const maxJobs = Number(process.env.BOOKMARK_DOWNLOAD_MAX_PAGE_JOBS_PER_TITLE ?? 0);
   const pageChapters = chapters

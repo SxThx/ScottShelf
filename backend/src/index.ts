@@ -1047,7 +1047,7 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
     await enqueueChapterPageDownloadJobsForChapters(
       { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
       chapters,
-      job.priority + 1
+      Math.max(50, job.priority + 1)
     );
     return;
   }
@@ -1069,7 +1069,7 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
       await enqueueChapterPageDownloadJobsForChapters(
         { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
         newChapters,
-        job.priority + 1
+        Math.max(50, job.priority + 1)
       );
     }
     return;
@@ -1102,7 +1102,7 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
   await enqueueChapterPageDownloadJobsForChapters(
     { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
     newChapters,
-    job.priority + 1
+    Math.max(50, job.priority + 1)
   );
 }
 
@@ -1144,7 +1144,7 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
     await enqueueChapterPageDownloadJobsForChapters(
       { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
       chapters,
-      job.priority + 1
+      Math.max(50, job.priority + 1)
     );
     return;
   }
@@ -1152,7 +1152,7 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
   if (job.jobType === "chapter_pages") {
     if (!job.chapterId) throw new Error("Chapter page download job is missing chapter id.");
     await withTimeout(
-      cachedChapterPages(source, job.chapterId, {
+      loadAndSaveChapterPages(source, job.chapterId, {
         mangaId: job.mangaId,
         chapterNumber: job.chapterNumber,
         language: job.language
