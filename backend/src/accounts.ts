@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
-import type { ChapterSummary } from "./sources/types";
+import type { ChapterPages, ChapterSummary } from "./sources/types";
 
 export type UserRole = "admin" | "user";
 
@@ -61,6 +61,22 @@ export interface BookmarkUpdateRecord {
   lastReadChapter?: string;
   checkedAt?: string;
   error?: string;
+}
+
+export type BookmarkDownloadJobType = "title_detail" | "latest_check" | "chapter_list" | "latest_chapters" | "chapter_pages";
+
+export interface BookmarkDownloadJobRecord {
+  id: string;
+  jobType: BookmarkDownloadJobType;
+  source: string;
+  mangaId: string;
+  canonicalKey?: string;
+  chapterId?: string;
+  chapterNumber?: string;
+  language: string;
+  priority: number;
+  attempts: number;
+  maxAttempts: number;
 }
 
 export interface RecommendationInput {
@@ -199,6 +215,31 @@ interface ChapterListCacheRow extends RowDataPacket {
   chapters_json: string;
   checked_at: Date | string;
   error: string | null;
+}
+
+interface ChapterPageCacheRow extends RowDataPacket {
+  source: string;
+  chapter_id: string;
+  manga_id: string | null;
+  chapter_number: string | null;
+  language: string;
+  pages_json: string;
+  checked_at: Date | string;
+  error: string | null;
+}
+
+interface BookmarkDownloadJobRow extends RowDataPacket {
+  id: string;
+  job_type: BookmarkDownloadJobType;
+  source: string;
+  manga_id: string;
+  canonical_key: string | null;
+  chapter_id: string | null;
+  chapter_number: string | null;
+  language: string;
+  priority: number;
+  attempts: number;
+  max_attempts: number;
 }
 
 const database = process.env.MYSQL_DATABASE ?? "mangass";
@@ -655,6 +696,47 @@ export async function initializeAccounts() {
       INDEX chapter_list_cache_checked_idx (checked_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await nextPool.query(`
+    CREATE TABLE IF NOT EXISTS chapter_page_cache (
+      source VARCHAR(64) NOT NULL,
+      chapter_id VARCHAR(255) NOT NULL,
+      manga_id VARCHAR(255) NULL,
+      chapter_number VARCHAR(64) NULL,
+      language VARCHAR(32) NOT NULL DEFAULT 'en',
+      pages_json JSON NOT NULL,
+      checked_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      error TEXT NULL,
+      PRIMARY KEY (source, chapter_id),
+      INDEX chapter_page_cache_manga_idx (source, manga_id, language),
+      INDEX chapter_page_cache_checked_idx (checked_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await nextPool.query(`
+    CREATE TABLE IF NOT EXISTS bookmark_download_jobs (
+      id CHAR(36) PRIMARY KEY,
+      dedupe_key VARCHAR(768) NOT NULL,
+      job_type VARCHAR(32) NOT NULL,
+      source VARCHAR(64) NOT NULL,
+      manga_id VARCHAR(255) NOT NULL,
+      canonical_key VARCHAR(512) NULL,
+      chapter_id VARCHAR(255) NULL,
+      chapter_number VARCHAR(64) NULL,
+      language VARCHAR(32) NOT NULL DEFAULT 'en',
+      priority INT NOT NULL DEFAULT 0,
+      attempts INT NOT NULL DEFAULT 0,
+      max_attempts INT NOT NULL DEFAULT 3,
+      status VARCHAR(32) NOT NULL DEFAULT 'pending',
+      run_after TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      locked_at TIMESTAMP(3) NULL,
+      locked_by VARCHAR(128) NULL,
+      error TEXT NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+      UNIQUE KEY bookmark_download_jobs_dedupe_idx (dedupe_key),
+      INDEX bookmark_download_jobs_claim_idx (status, run_after, priority, created_at),
+      INDEX bookmark_download_jobs_ref_idx (source, manga_id, job_type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
   await ensureIndex(nextPool, "favorites", "favorites_user_added_idx", "(user_id, added_at)");
   await ensureIndex(nextPool, "reading_progress", "reading_progress_user_updated_idx", "(user_id, updated_at)");
   await ensureIndex(nextPool, "reading_progress", "reading_progress_user_canonical_idx", "(user_id, canonical_key)");
@@ -756,6 +838,10 @@ export async function databaseStatus() {
   const [bookmarkUpdateCache] = await db
     .query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM bookmark_update_cache")
     .catch(() => [[]]);
+  const [chapterPageCache] = await db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM chapter_page_cache").catch(() => [[]]);
+  const [bookmarkDownloadJobs] = await db
+    .query<RowDataPacket[]>("SELECT status, COUNT(*) AS count FROM bookmark_download_jobs GROUP BY status")
+    .catch(() => [[]]);
 
   return {
     database,
@@ -769,7 +855,9 @@ export async function databaseStatus() {
       interactionBlocks: Number(interactionBlocks[0]?.count ?? 0),
       titleMetadata: Number(titleMetadata[0]?.count ?? 0),
       compiledTitleCache: Number(compiledTitleCache[0]?.count ?? 0),
-      bookmarkUpdateCache: Number(bookmarkUpdateCache[0]?.count ?? 0)
+      bookmarkUpdateCache: Number(bookmarkUpdateCache[0]?.count ?? 0),
+      chapterPageCache: Number(chapterPageCache[0]?.count ?? 0),
+      bookmarkDownloadJobs: Object.fromEntries(bookmarkDownloadJobs.map((row) => [String(row.status), Number(row.count ?? 0)]))
     }
   };
 }
@@ -1180,6 +1268,299 @@ export async function upsertChapterListCache(input: {
       input.error?.slice(0, 2000) ?? null
     ]
   );
+}
+
+function parsePages(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string" && Boolean(item));
+  if (typeof value !== "string") return [];
+  try {
+    return parsePages(JSON.parse(value));
+  } catch {
+    return [];
+  }
+}
+
+export async function getChapterPageCache(source: string, chapterId: string) {
+  const db = await getPool();
+  const [rows] = await db.execute<ChapterPageCacheRow[]>(
+    `
+      SELECT *
+      FROM chapter_page_cache
+      WHERE source = ? AND chapter_id = ?
+      LIMIT 1
+    `,
+    [source, chapterId]
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+
+  return {
+    pages: {
+      source: row.source,
+      id: row.chapter_id,
+      pages: parsePages(row.pages_json)
+    } as ChapterPages,
+    mangaId: row.manga_id || undefined,
+    chapterNumber: row.chapter_number || undefined,
+    language: row.language,
+    checkedAt: toIsoDate(row.checked_at),
+    error: row.error || undefined
+  };
+}
+
+export async function upsertChapterPageCache(input: {
+  source: string;
+  chapterId: string;
+  mangaId?: string;
+  chapterNumber?: string;
+  language?: string;
+  pages?: string[];
+  error?: string;
+}) {
+  const db = await getPool();
+  await db.execute(
+    `
+      INSERT INTO chapter_page_cache (source, chapter_id, manga_id, chapter_number, language, pages_json, checked_at, error)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?)
+      ON DUPLICATE KEY UPDATE
+        manga_id = COALESCE(VALUES(manga_id), manga_id),
+        chapter_number = COALESCE(VALUES(chapter_number), chapter_number),
+        language = VALUES(language),
+        pages_json = CASE
+          WHEN VALUES(error) IS NULL THEN VALUES(pages_json)
+          ELSE pages_json
+        END,
+        checked_at = CURRENT_TIMESTAMP(3),
+        error = VALUES(error)
+    `,
+    [
+      input.source,
+      input.chapterId,
+      input.mangaId ?? null,
+      input.chapterNumber ?? null,
+      input.language ?? "en",
+      JSON.stringify(input.pages ?? []),
+      input.error?.slice(0, 2000) ?? null
+    ]
+  );
+}
+
+function bookmarkDownloadJobRecord(row: BookmarkDownloadJobRow): BookmarkDownloadJobRecord {
+  return {
+    id: row.id,
+    jobType: row.job_type,
+    source: row.source,
+    mangaId: row.manga_id,
+    canonicalKey: row.canonical_key || undefined,
+    chapterId: row.chapter_id || undefined,
+    chapterNumber: row.chapter_number || undefined,
+    language: row.language,
+    priority: row.priority,
+    attempts: row.attempts,
+    maxAttempts: row.max_attempts
+  };
+}
+
+function bookmarkDownloadDedupeKey(input: {
+  jobType: BookmarkDownloadJobType;
+  source: string;
+  mangaId: string;
+  chapterId?: string;
+  language?: string;
+}) {
+  return [input.jobType, input.source, input.mangaId, input.language ?? "en", input.chapterId ?? ""].join(":").slice(0, 768);
+}
+
+export async function enqueueBookmarkDownloadJob(input: {
+  jobType: BookmarkDownloadJobType;
+  source: string;
+  mangaId: string;
+  canonicalKey?: string;
+  chapterId?: string;
+  chapterNumber?: string;
+  language?: string;
+  priority?: number;
+  maxAttempts?: number;
+  runAfter?: Date;
+  refreshExisting?: boolean;
+}) {
+  if (!input.source || !input.mangaId) return;
+  const db = await getPool();
+  const dedupeKey = bookmarkDownloadDedupeKey(input);
+  const refreshExisting = input.refreshExisting !== false;
+  await db.execute(
+    `
+      INSERT INTO bookmark_download_jobs (
+        id, dedupe_key, job_type, source, manga_id, canonical_key, chapter_id, chapter_number, language,
+        priority, max_attempts, status, run_after
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      ON DUPLICATE KEY UPDATE
+        canonical_key = COALESCE(VALUES(canonical_key), canonical_key),
+        chapter_number = COALESCE(VALUES(chapter_number), chapter_number),
+        priority = GREATEST(priority, VALUES(priority)),
+        max_attempts = GREATEST(max_attempts, VALUES(max_attempts)),
+        attempts = CASE
+          WHEN status = 'running' OR (status = 'done' AND ? = 0) THEN attempts
+          ELSE 0
+        END,
+        run_after = CASE
+          WHEN status = 'done' AND ? = 0 THEN run_after
+          ELSE LEAST(run_after, VALUES(run_after))
+        END,
+        status = CASE
+          WHEN status = 'running' THEN status
+          WHEN status = 'done' AND ? = 0 THEN status
+          ELSE 'pending'
+        END,
+        error = NULL,
+        updated_at = CURRENT_TIMESTAMP(3)
+    `,
+    [
+      crypto.randomUUID(),
+      dedupeKey,
+      input.jobType,
+      input.source,
+      input.mangaId,
+      input.canonicalKey ?? null,
+      input.chapterId ?? null,
+      input.chapterNumber ?? null,
+      input.language ?? "en",
+      input.priority ?? 0,
+      input.maxAttempts ?? 3,
+      input.runAfter ?? new Date(),
+      refreshExisting ? 1 : 0,
+      refreshExisting ? 1 : 0,
+      refreshExisting ? 1 : 0
+    ]
+  );
+}
+
+export async function enqueueBookmarkDownloadsForRef(
+  ref: { source: string; mangaId: string; canonicalKey?: string },
+  priority = 0,
+  refreshExisting = false
+) {
+  await enqueueBookmarkDownloadJob({ jobType: "title_detail", ...ref, priority, refreshExisting });
+  await enqueueBookmarkDownloadJob({ jobType: "chapter_list", ...ref, priority, refreshExisting });
+}
+
+export async function enqueueBookmarkDownloadsForAll(limit = 500) {
+  const refs = await listFavoriteRefs(limit);
+  for (const ref of refs) {
+    await enqueueBookmarkDownloadsForRef(ref);
+  }
+  return refs.length;
+}
+
+export async function enqueueChapterPageDownloadJobsForChapters(
+  ref: { source: string; mangaId: string; canonicalKey?: string; language?: string },
+  chapters: ChapterSummary[],
+  priority = 1
+) {
+  const maxJobs = Number(process.env.BOOKMARK_DOWNLOAD_MAX_PAGE_JOBS_PER_TITLE ?? 0);
+  const pageChapters = chapters
+    .filter((chapter) => chapter.source && chapter.id)
+    .slice(0, maxJobs > 0 ? maxJobs : chapters.length);
+
+  for (const chapter of pageChapters) {
+    await enqueueBookmarkDownloadJob({
+      jobType: "chapter_pages",
+      source: chapter.source,
+      mangaId: chapter.mangaId || ref.mangaId,
+      canonicalKey: ref.canonicalKey,
+      chapterId: chapter.id,
+      chapterNumber: chapter.chapter,
+      language: chapter.language || ref.language || "en",
+      priority,
+      maxAttempts: 2,
+      refreshExisting: false
+    });
+  }
+  return pageChapters.length;
+}
+
+export async function claimBookmarkDownloadJobs(limit: number, workerId: string) {
+  const db = await getPool();
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const safeLimit = Math.max(Math.min(Math.floor(limit), 25), 1);
+    const [rows] = await connection.query<BookmarkDownloadJobRow[]>(
+      `
+        SELECT id, job_type, source, manga_id, canonical_key, chapter_id, chapter_number, language, priority, attempts + 1 AS attempts, max_attempts
+        FROM bookmark_download_jobs
+        WHERE status = 'pending' AND run_after <= CURRENT_TIMESTAMP(3) AND attempts < max_attempts
+        ORDER BY priority DESC, created_at ASC
+        LIMIT ${safeLimit}
+        FOR UPDATE SKIP LOCKED
+      `
+    );
+    if (rows.length) {
+      await connection.query(
+        `
+          UPDATE bookmark_download_jobs
+          SET status = 'running',
+            attempts = attempts + 1,
+            locked_at = CURRENT_TIMESTAMP(3),
+            locked_by = ?,
+            updated_at = CURRENT_TIMESTAMP(3)
+          WHERE id IN (${rows.map(() => "?").join(", ")})
+        `,
+        [workerId, ...rows.map((row) => row.id)]
+      );
+    }
+    await connection.commit();
+    return rows.map(bookmarkDownloadJobRecord);
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+export async function completeBookmarkDownloadJob(id: string) {
+  const db = await getPool();
+  await db.execute(
+    `
+      UPDATE bookmark_download_jobs
+      SET status = 'done', locked_at = NULL, locked_by = NULL, error = NULL, updated_at = CURRENT_TIMESTAMP(3)
+      WHERE id = ?
+    `,
+    [id]
+  );
+}
+
+export async function failBookmarkDownloadJob(job: BookmarkDownloadJobRecord, error: unknown) {
+  const db = await getPool();
+  const message = error instanceof Error ? error.message : String(error);
+  const terminal = job.attempts >= job.maxAttempts;
+  const delaySeconds = Math.min(60 * Math.max(1, 2 ** Math.max(job.attempts - 1, 0)), 60 * 30);
+  await db.execute(
+    `
+      UPDATE bookmark_download_jobs
+      SET status = ?,
+        run_after = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND),
+        locked_at = NULL,
+        locked_by = NULL,
+        error = ?,
+        updated_at = CURRENT_TIMESTAMP(3)
+      WHERE id = ?
+    `,
+    [terminal ? "failed" : "pending", delaySeconds, message.slice(0, 2000), job.id]
+  );
+}
+
+export async function getBookmarkUpdateLatest(source: string, mangaId: string) {
+  const db = await getPool();
+  const [rows] = await db.execute<BookmarkUpdateCacheRow[]>(
+    "SELECT * FROM bookmark_update_cache WHERE source = ? AND manga_id = ? LIMIT 1",
+    [source, mangaId]
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return bookmarkUpdateRowToChapter(row);
 }
 
 export async function listCachedBookmarkUpdates(userId: string, limit = 12): Promise<BookmarkUpdateRecord[]> {

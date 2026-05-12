@@ -10,13 +10,22 @@ import {
   addInteractionBlock,
   changePassword,
   addFavorite,
+  claimBookmarkDownloadJobs,
   clearRecommendations,
+  completeBookmarkDownloadJob,
   createUser,
   databaseLabel,
   databaseStatus,
   deleteRecommendation,
   deleteUser,
   destroySession,
+  enqueueBookmarkDownloadJob,
+  enqueueBookmarkDownloadsForAll,
+  enqueueBookmarkDownloadsForRef,
+  enqueueChapterPageDownloadJobsForChapters,
+  failBookmarkDownloadJob,
+  getBookmarkUpdateLatest,
+  getChapterPageCache,
   getUserByToken,
   getChapterListCache,
   importFavorites,
@@ -39,8 +48,10 @@ import {
   sendRecommendation,
   setUserNsfwAllowed,
   upsertChapterListCache,
+  upsertChapterPageCache,
   upsertBookmarkUpdateCache,
   unreadRecommendationCount,
+  type BookmarkDownloadJobRecord,
   type UserRole
 } from "./accounts";
 import { cached, cacheKey, cacheStats, cacheTtl, warmCache } from "./cache";
@@ -313,12 +324,68 @@ async function cachedChapters(source: MangaSource, id: string, language: string,
   return cached(memoryKey, cacheTtl.chapters, () => loadAndSaveChapters(source, id, language));
 }
 
-function cachedChapterPages(source: MangaSource, id: string) {
-  return cached(
-    cacheKey("source.chapterPages", { source: source.info.id, id }),
-    cacheTtl.chapterPages,
-    () => source.getChapterPages(id)
-  );
+const chapterPageRefreshes = new Set<string>();
+const chapterPagePersistentTtlMs = Number(process.env.CHAPTER_PAGE_CACHE_TTL_MS ?? 1000 * 60 * 60 * 24 * 7);
+
+type ChapterPageCacheContext = {
+  mangaId?: string;
+  chapterNumber?: string;
+  language?: string;
+};
+
+async function loadAndSaveChapterPages(source: MangaSource, id: string, context: ChapterPageCacheContext = {}) {
+  try {
+    const pages = await source.getChapterPages(id);
+    await upsertChapterPageCache({
+      source: source.info.id,
+      chapterId: id,
+      mangaId: context.mangaId,
+      chapterNumber: context.chapterNumber,
+      language: context.language ?? "en",
+      pages: pages.pages
+    }).catch((error: Error) => console.warn(`Chapter page cache save failed for ${source.info.id}:${id}:`, error.message));
+    return pages;
+  } catch (error) {
+    await upsertChapterPageCache({
+      source: source.info.id,
+      chapterId: id,
+      mangaId: context.mangaId,
+      chapterNumber: context.chapterNumber,
+      language: context.language ?? "en",
+      error: error instanceof Error ? error.message : String(error)
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+function refreshChapterPageCache(source: MangaSource, id: string, context: ChapterPageCacheContext = {}) {
+  const key = `${source.info.id}:${id}`;
+  if (chapterPageRefreshes.has(key)) return;
+  chapterPageRefreshes.add(key);
+  cached(cacheKey("source.chapterPages", { source: source.info.id, id }), cacheTtl.chapterPages, () =>
+    loadAndSaveChapterPages(source, id, context)
+  )
+    .catch((error: Error) => console.warn(`Chapter page refresh failed for ${key}:`, error.message))
+    .finally(() => chapterPageRefreshes.delete(key));
+}
+
+async function cachedChapterPages(source: MangaSource, id: string, context: ChapterPageCacheContext = {}) {
+  const memoryKey = cacheKey("source.chapterPages", { source: source.info.id, id });
+  const persistent = await getChapterPageCache(source.info.id, id).catch(() => undefined);
+  if (persistent?.pages.pages.length) {
+    const age = Date.now() - new Date(persistent.checkedAt).getTime();
+    if (Number.isFinite(age) && age < chapterPagePersistentTtlMs) {
+      return cached(memoryKey, cacheTtl.chapterPages, () => Promise.resolve(persistent.pages));
+    }
+    refreshChapterPageCache(source, id, {
+      mangaId: context.mangaId ?? persistent.mangaId,
+      chapterNumber: context.chapterNumber ?? persistent.chapterNumber,
+      language: context.language ?? persistent.language
+    });
+    return persistent.pages;
+  }
+
+  return cached(memoryKey, cacheTtl.chapterPages, () => loadAndSaveChapterPages(source, id, context));
 }
 
 function publicCache(res: express.Response, maxAgeSeconds: number) {
@@ -560,7 +627,11 @@ async function fallbackChapterPages(
     const chapters = await cachedChapters(source, mirror.id, language).catch(() => []);
     const match = chapters.find((chapter) => chapter.chapter === chapterNumber);
     if (!match) continue;
-    const pages = await cachedChapterPages(source, match.id).catch(() => undefined);
+    const pages = await cachedChapterPages(source, match.id, {
+      mangaId: match.mangaId,
+      chapterNumber: match.chapter,
+      language: match.language
+    }).catch(() => undefined);
     if (pages?.pages.length) return pages;
   }
   return undefined;
@@ -724,6 +795,63 @@ function latestChapterFrom(chapters: ChapterSummary[]) {
   })[0];
 }
 
+function chapterSortValue(chapter: ChapterSummary) {
+  return chapterNumberValue(chapter.chapter) ?? -1;
+}
+
+function maxChapterNumber(chapters: ChapterSummary[]) {
+  const values = chapters.map((chapter) => chapterNumberValue(chapter.chapter)).filter((value): value is number => value !== undefined);
+  return values.length ? Math.max(...values) : undefined;
+}
+
+function chapterCacheKey(chapter: ChapterSummary) {
+  return chapter.id ? `${chapter.source}:${chapter.id}` : `${chapter.source}:${chapter.mangaId}:${chapter.chapter ?? chapter.title}`;
+}
+
+function sortChaptersForCache(chapters: ChapterSummary[]) {
+  return [...chapters].sort((left, right) => {
+    const rightNumber = chapterSortValue(right);
+    const leftNumber = chapterSortValue(left);
+    if (rightNumber !== leftNumber) return rightNumber - leftNumber;
+    return chapterDateValue(right) - chapterDateValue(left);
+  });
+}
+
+function mergeChapterLists(existing: ChapterSummary[], incoming: ChapterSummary[]) {
+  const byKey = new Map<string, ChapterSummary>();
+  for (const chapter of existing) {
+    byKey.set(chapterCacheKey(chapter), chapter);
+  }
+  for (const chapter of incoming) {
+    byKey.set(chapterCacheKey(chapter), chapter);
+  }
+  return sortChaptersForCache([...byKey.values()]);
+}
+
+function missingNewChapters(existing: ChapterSummary[], incoming: ChapterSummary[]) {
+  const existingKeys = new Set(existing.map(chapterCacheKey));
+  const existingMax = maxChapterNumber(existing);
+  return incoming.filter((chapter) => {
+    if (existingKeys.has(chapterCacheKey(chapter))) return false;
+    const chapterNumber = chapterNumberValue(chapter.chapter);
+    return existingMax === undefined || chapterNumber === undefined || chapterNumber > existingMax;
+  });
+}
+
+function latestChapterFromManga(manga: MangaSummary): ChapterSummary | undefined {
+  if (!manga.latestChapter) return undefined;
+  return {
+    source: manga.source,
+    id: `${manga.source}:${manga.id}:latest:${manga.latestChapter}`,
+    mangaId: manga.id,
+    title: manga.latestChapter ? `Chapter ${manga.latestChapter}` : "",
+    chapter: manga.latestChapter,
+    language: "en",
+    publishedAt: manga.latestChapterReleasedAt,
+    groups: []
+  };
+}
+
 function compactHomeManga(manga: MangaSummary, extra: Record<string, unknown> = {}) {
   return {
     source: manga.source,
@@ -862,6 +990,226 @@ function startCacheWarmer() {
   };
 
   setTimeout(run, 2500);
+  setInterval(run, intervalMs);
+}
+
+async function enqueueLatestCheckJobs() {
+  const refs = await listFavoriteRefs(Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500));
+  for (const ref of refs) {
+    await enqueueBookmarkDownloadJob({ jobType: "latest_check", ...ref, priority: 30 });
+  }
+  return refs.length;
+}
+
+async function runLatestCheckJob(source: MangaSource, job: BookmarkDownloadJobRecord) {
+  const previous = await getBookmarkUpdateLatest(job.source, job.mangaId).catch(() => undefined);
+  const manga = await withTimeout(
+    loadSourceManga(source, job.mangaId),
+    Number(process.env.BOOKMARK_LATEST_CHECK_TIMEOUT_MS ?? 15000),
+    `${source.info.name} latest check`
+  );
+  const latestChapter = latestChapterFromManga(manga);
+  if (!latestChapter) return;
+
+  if (!previous || previous.chapter !== latestChapter.chapter) {
+    await upsertBookmarkUpdateCache({
+      source: job.source,
+      mangaId: job.mangaId,
+      canonicalKey: job.canonicalKey ?? manga.canonicalKey,
+      latestChapter
+    });
+    await enqueueBookmarkDownloadJob({
+      jobType: "latest_chapters",
+      source: job.source,
+      mangaId: job.mangaId,
+      canonicalKey: job.canonicalKey ?? manga.canonicalKey,
+      language: job.language,
+      priority: 40
+    });
+  }
+}
+
+async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJobRecord) {
+  const persistent = await getChapterListCache(job.source, job.mangaId, job.language).catch(() => undefined);
+  const existing = persistent?.chapters ?? [];
+  if (!existing.length) {
+    const chapters = await withTimeout(
+      loadAndSaveChapters(source, job.mangaId, job.language),
+      Number(process.env.BOOKMARK_DOWNLOAD_CHAPTER_LIST_TIMEOUT_MS ?? 120000),
+      `${source.info.name} initial chapter list download`
+    );
+    await upsertBookmarkUpdateCache({
+      source: job.source,
+      mangaId: job.mangaId,
+      canonicalKey: job.canonicalKey,
+      latestChapter: latestChapterFrom(chapters)
+    });
+    await enqueueChapterPageDownloadJobsForChapters(
+      { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+      chapters,
+      job.priority + 1
+    );
+    return;
+  }
+
+  if (!source.getChapterPreview) {
+    const chapters = await withTimeout(
+      loadAndSaveChapters(source, job.mangaId, job.language),
+      Number(process.env.BOOKMARK_DOWNLOAD_CHAPTER_LIST_TIMEOUT_MS ?? 120000),
+      `${source.info.name} chapter list refresh`
+    );
+    const newChapters = missingNewChapters(existing, chapters);
+    await upsertBookmarkUpdateCache({
+      source: job.source,
+      mangaId: job.mangaId,
+      canonicalKey: job.canonicalKey,
+      latestChapter: latestChapterFrom(chapters)
+    });
+    if (newChapters.length) {
+      await enqueueChapterPageDownloadJobsForChapters(
+        { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+        newChapters,
+        job.priority + 1
+      );
+    }
+    return;
+  }
+
+  const latestPreview = await withTimeout(
+    source.getChapterPreview(job.mangaId, job.language),
+    Number(process.env.BOOKMARK_LATEST_CHAPTERS_TIMEOUT_MS ?? 30000),
+    `${source.info.name} latest chapters refresh`
+  );
+  const newChapters = missingNewChapters(existing, latestPreview);
+  if (!newChapters.length) return;
+
+  const merged = mergeChapterLists(existing, newChapters);
+  await upsertCanonicalChapters(job.source, job.mangaId, job.language, newChapters).catch((error: Error) =>
+    console.warn(`Canonical latest chapter save failed for ${job.source}:${job.mangaId}:`, error.message)
+  );
+  await upsertChapterListCache({
+    source: job.source,
+    mangaId: job.mangaId,
+    language: job.language,
+    chapters: merged
+  });
+  await upsertBookmarkUpdateCache({
+    source: job.source,
+    mangaId: job.mangaId,
+    canonicalKey: job.canonicalKey,
+    latestChapter: latestChapterFrom(merged)
+  });
+  await enqueueChapterPageDownloadJobsForChapters(
+    { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+    newChapters,
+    job.priority + 1
+  );
+}
+
+async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
+  const source = getSource(job.source);
+  if (!source?.info.enabled) throw new Error(`Source is unavailable: ${job.source}`);
+
+  if (job.jobType === "latest_check") {
+    await runLatestCheckJob(source, job);
+    return;
+  }
+
+  if (job.jobType === "latest_chapters") {
+    await runLatestChaptersJob(source, job);
+    return;
+  }
+
+  if (job.jobType === "title_detail") {
+    await withTimeout(
+      loadSourceManga(source, job.mangaId),
+      Number(process.env.BOOKMARK_DOWNLOAD_DETAIL_TIMEOUT_MS ?? 30000),
+      `${source.info.name} title download`
+    );
+    return;
+  }
+
+  if (job.jobType === "chapter_list") {
+    const chapters = await withTimeout(
+      loadAndSaveChapters(source, job.mangaId, job.language),
+      Number(process.env.BOOKMARK_DOWNLOAD_CHAPTER_LIST_TIMEOUT_MS ?? 120000),
+      `${source.info.name} chapter list download`
+    );
+    await upsertBookmarkUpdateCache({
+      source: job.source,
+      mangaId: job.mangaId,
+      canonicalKey: job.canonicalKey,
+      latestChapter: latestChapterFrom(chapters)
+    });
+    await enqueueChapterPageDownloadJobsForChapters(
+      { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+      chapters,
+      job.priority + 1
+    );
+    return;
+  }
+
+  if (job.jobType === "chapter_pages") {
+    if (!job.chapterId) throw new Error("Chapter page download job is missing chapter id.");
+    await withTimeout(
+      cachedChapterPages(source, job.chapterId, {
+        mangaId: job.mangaId,
+        chapterNumber: job.chapterNumber,
+        language: job.language
+      }),
+      Number(process.env.BOOKMARK_DOWNLOAD_PAGES_TIMEOUT_MS ?? 60000),
+      `${source.info.name} chapter page download`
+    );
+  }
+}
+
+function startBookmarkDownloadWorker() {
+  if (process.env.BOOKMARK_DOWNLOAD_WORKER === "0") return;
+
+  const workerId = `scottshelf-${process.pid}`;
+  const batchSize = Number(process.env.BOOKMARK_DOWNLOAD_BATCH_SIZE ?? 1);
+  const intervalMs = Number(process.env.BOOKMARK_DOWNLOAD_INTERVAL_MS ?? 5000);
+  const backfillLimit = Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500);
+  const latestIntervalMs = Number(process.env.BOOKMARK_LATEST_CHECK_INTERVAL_MS ?? 1000 * 60 * 10);
+  let running = false;
+
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const jobs = await claimBookmarkDownloadJobs(batchSize, workerId);
+      for (const job of jobs) {
+        try {
+          await processBookmarkDownloadJob(job);
+          await completeBookmarkDownloadJob(job.id);
+        } catch (error) {
+          await failBookmarkDownloadJob(job, error);
+        }
+      }
+    } catch (error) {
+      console.warn("Bookmark download worker failed:", error instanceof Error ? error.message : String(error));
+    } finally {
+      running = false;
+    }
+  };
+
+  if (process.env.BOOKMARK_DOWNLOAD_BACKFILL_ON_START !== "0") {
+    setTimeout(() => {
+      enqueueBookmarkDownloadsForAll(backfillLimit)
+        .then((count) => console.log(`Bookmark download backfill queued ${count} titles.`))
+        .catch((error: Error) => console.warn("Bookmark download backfill failed:", error.message));
+    }, 5000);
+  }
+
+  if (latestIntervalMs > 0) {
+    setInterval(() => {
+      enqueueLatestCheckJobs()
+        .then((count) => console.log(`Bookmark latest checks queued ${count} titles.`))
+        .catch((error: Error) => console.warn("Bookmark latest check queue failed:", error.message));
+    }, latestIntervalMs);
+  }
+
+  setTimeout(run, 8000);
   setInterval(run, intervalMs);
 }
 
@@ -1182,6 +1530,9 @@ app.post(
 
     favorite.canonicalKey ??= await canonicalKeyForManga(favorite.source, favorite.mangaId, favorite.title);
     const favorites = await addFavorite(user.id, favorite);
+    void enqueueBookmarkDownloadsForRef({ source: favorite.source, mangaId: favorite.mangaId, canonicalKey: favorite.canonicalKey }, 100, true).catch(
+      (error: Error) => console.warn(`Bookmark download queue failed for ${favorite.source}:${favorite.mangaId}:`, error.message)
+    );
     res.status(201).json({ favorites });
   })
 );
@@ -1200,6 +1551,9 @@ app.post(
     const progress = progressRows.map(progressInput).filter((item: unknown): item is ProgressInput => Boolean(item));
 
     const nextFavorites = await importFavorites(user.id, favorites, progress);
+    void enqueueBookmarkDownloadsForAll(Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500)).catch((error: Error) =>
+      console.warn("Bookmark import download queue failed:", error.message)
+    );
     res.status(201).json({
       favorites: nextFavorites,
       imported: {
@@ -1440,7 +1794,7 @@ app.get(
     const language = typeof req.query.language === "string" ? req.query.language : "en";
     const mangaId = typeof req.query.mangaId === "string" ? req.query.mangaId : undefined;
     const chapterNumber = typeof req.query.chapterNumber === "string" ? req.query.chapterNumber : undefined;
-    const pages = await cachedChapterPages(source, req.params.id).catch(async (error) => {
+    const pages = await cachedChapterPages(source, req.params.id, { mangaId, chapterNumber, language }).catch(async (error) => {
       const fallback = await fallbackChapterPages(source, mangaId, chapterNumber, language);
       if (fallback) return fallback;
       throw error;
@@ -1517,6 +1871,7 @@ initializeAccounts()
 	    console.log("Ensured tables: users, favorites, reading_progress, recommendations, title_metadata");
       startMetadataRefreshCron();
 	    startCacheWarmer();
+      startBookmarkDownloadWorker();
     app.listen(port, () => {
       console.log(`ScottShelf API listening on http://localhost:${port}`);
     });
