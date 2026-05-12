@@ -138,6 +138,9 @@ interface FavoriteRow extends RowDataPacket {
   year: number | null;
   latest_chapter: string | null;
   latest_chapter_released_at: Date | string | null;
+  cached_latest_chapter_number?: string | null;
+  cached_latest_chapter_published_at?: Date | string | null;
+  cached_latest_chapter_readable_at?: Date | string | null;
   tags_json: string;
   added_at: Date | string;
   last_read_chapter_id: string | null;
@@ -426,8 +429,11 @@ function favoriteRecord(row: FavoriteRow): FavoriteRecord {
     contentRating: row.content_rating || undefined,
     demographic: row.demographic || undefined,
     year: row.year || undefined,
-    latestChapter: row.latest_chapter || undefined,
-    latestChapterReleasedAt: optionalIsoDate(row.latest_chapter_released_at),
+    latestChapter: row.cached_latest_chapter_number || row.latest_chapter || undefined,
+    latestChapterReleasedAt:
+      optionalIsoDate(row.cached_latest_chapter_published_at ?? null) ??
+      optionalIsoDate(row.cached_latest_chapter_readable_at ?? null) ??
+      optionalIsoDate(row.latest_chapter_released_at),
     tags: parseTags(row.tags_json),
     addedAt: toIsoDate(row.added_at),
     lastReadChapterId: row.last_read_chapter_id || undefined,
@@ -1077,6 +1083,9 @@ export async function listFavorites(userId: string) {
       SELECT
         favorites.*,
         COALESCE(favorites.canonical_key, CONCAT('mu:', title_metadata_links.manga_updates_id)) AS effective_canonical_key,
+        bookmark_update_cache.latest_chapter_number AS cached_latest_chapter_number,
+        bookmark_update_cache.latest_chapter_published_at AS cached_latest_chapter_published_at,
+        bookmark_update_cache.latest_chapter_readable_at AS cached_latest_chapter_readable_at,
         reading_progress.chapter_id AS last_read_chapter_id,
         reading_progress.chapter_number AS last_read_chapter_number,
         reading_progress.scroll_position AS last_read_scroll_position
@@ -1084,6 +1093,9 @@ export async function listFavorites(userId: string) {
       LEFT JOIN title_metadata_links
         ON title_metadata_links.source = favorites.source
         AND title_metadata_links.manga_id = favorites.manga_id
+      LEFT JOIN bookmark_update_cache
+        ON bookmark_update_cache.source = favorites.source
+        AND bookmark_update_cache.manga_id = favorites.manga_id
       LEFT JOIN reading_progress
         ON reading_progress.user_id = favorites.user_id
         AND (
