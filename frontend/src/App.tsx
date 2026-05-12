@@ -172,9 +172,9 @@ function loadReaderPageWidth() {
 function loadReaderTopControls() {
   try {
     const saved = localStorage.getItem(READER_TOP_CONTROLS_KEY);
-    return saved === null ? true : saved === "true";
+    return saved === "true";
   } catch {
-    return true;
+    return false;
   }
 }
 
