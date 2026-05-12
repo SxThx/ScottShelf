@@ -99,6 +99,7 @@ const SHOW_NSFW_KEY = "mangass:show-nsfw";
 const ACTIVE_READER_POSITION_KEY = "mangass:active-reader-position";
 const READER_TIP_DISMISSED_KEY = "mangass:reader-tip-dismissed";
 const READER_PAGE_WIDTH_KEY = "mangass:reader-page-width";
+const READER_TOP_CONTROLS_KEY = "mangass:reader-top-controls";
 const READER_PAGE_WIDTH_MIN = 720;
 const READER_PAGE_WIDTH_MAX = 1600;
 const READING_PROGRESS_SAVE_INTERVAL_MS = 30_000;
@@ -166,6 +167,15 @@ function loadReaderPageWidth() {
     // Use the default width when storage is unavailable.
   }
   return fallback;
+}
+
+function loadReaderTopControls() {
+  try {
+    const saved = localStorage.getItem(READER_TOP_CONTROLS_KEY);
+    return saved === null ? true : saved === "true";
+  } catch {
+    return true;
+  }
 }
 
 function clampReaderPageWidth(value: number) {
@@ -3519,10 +3529,12 @@ function ReaderView({
   const [readerPageMode, setReaderPageMode] = useState<ReaderPageMode>("single");
   const [progressPosition, setProgressPosition] = useState<ReaderProgressPosition>("bottom");
   const [readerPageWidth, setReaderPageWidth] = useState(loadReaderPageWidth);
+  const [topChapterControlsEnabled, setTopChapterControlsEnabled] = useState(loadReaderTopControls);
   const [pagedPageIndex, setPagedPageIndex] = useState(0);
   const [readerPercent, setReaderPercent] = useState(0);
   const [readerTipVisible, setReaderTipVisible] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [mobilePanelAnchor, setMobilePanelAnchor] = useState<"top" | "bottom">("bottom");
 
   useEffect(() => {
     chaptersRef.current = [];
@@ -3727,6 +3739,14 @@ function ReaderView({
       // Width preference is optional.
     }
   }, [readerPageWidth]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(READER_TOP_CONTROLS_KEY, String(topChapterControlsEnabled));
+    } catch {
+      // The duplicate controls preference is optional.
+    }
+  }, [topChapterControlsEnabled]);
 
   useEffect(() => {
     if (!pagedReader || !pages?.pages.length) return;
@@ -4202,7 +4222,7 @@ function ReaderView({
   function MobileReaderPanel() {
     if (!mobilePickerOpen && !mobileSettingsOpen) return null;
     return (
-      <div className="reader-mobile-panel" role="dialog" aria-modal="false">
+      <div className={`reader-mobile-panel reader-mobile-panel--${mobilePanelAnchor}`} role="dialog" aria-modal="false">
         {mobilePickerOpen && (
           <>
             <div className="reader-mobile-panel__title">Chapter</div>
@@ -4289,10 +4309,25 @@ function ReaderView({
               </button>
             </div>
 
+            <div className="reader-mobile-panel__title">Chapter controls</div>
+            <div className="reader-setting-group" role="group" aria-label="Chapter controls">
+              <button className={topChapterControlsEnabled ? "active" : ""} type="button" onClick={() => setTopChapterControlsEnabled((enabled) => !enabled)}>
+                <FontAwesomeIcon icon={faArrowUp} aria-hidden="true" />
+                <span>Top controls</span>
+              </button>
+            </div>
+
           </>
         )}
       </div>
     );
+  }
+
+  function openMobilePicker(anchor: "top" | "bottom") {
+    setMobilePanelAnchor(anchor);
+    setMobileSettingsOpen(false);
+    setMobilePickerOpen((open) => (mobilePanelAnchor === anchor ? !open : true));
+    setMobileControlsVisible(true);
   }
 
   function MobileReaderControls() {
@@ -4314,6 +4349,20 @@ function ReaderView({
             <span>{currentSourceLabel}</span>
           </div>
         </div>
+        {topChapterControlsEnabled && (
+          <div className="reader-mobile-controls reader-mobile-controls--top" aria-label="Top reader controls">
+            <button className="reader-mobile-icon-button" type="button" onClick={() => void changeAdjacentChapter("previous")} disabled={chaptersRefreshing} aria-label="Previous chapter">
+              <FontAwesomeIcon icon={faChevronLeft} aria-hidden="true" />
+            </button>
+            <button className="reader-mobile-chapter-button" type="button" onClick={() => openMobilePicker("top")}>
+              <span>{readerChapterProgressLabel}</span>
+              <FontAwesomeIcon icon={faChevronUp} aria-hidden="true" />
+            </button>
+            <button className="reader-mobile-icon-button" type="button" onClick={() => void changeAdjacentChapter("next")} disabled={chaptersRefreshing} aria-label="Next chapter">
+              <FontAwesomeIcon icon={faChevronRight} aria-hidden="true" />
+            </button>
+          </div>
+        )}
         <MobileReaderPanel />
         <div className="reader-mobile-controls" aria-label="Reader controls">
           <button className="reader-mobile-icon-button" type="button" onClick={() => void changeAdjacentChapter("previous")} disabled={chaptersRefreshing} aria-label="Previous chapter">
@@ -4322,11 +4371,7 @@ function ReaderView({
           <button
             className="reader-mobile-chapter-button"
             type="button"
-            onClick={() => {
-              setMobileSettingsOpen(false);
-              setMobilePickerOpen((open) => !open);
-              setMobileControlsVisible(true);
-            }}
+            onClick={() => openMobilePicker("bottom")}
           >
             <span>{readerChapterProgressLabel}</span>
             <FontAwesomeIcon icon={faChevronUp} aria-hidden="true" />
@@ -4351,6 +4396,7 @@ function ReaderView({
               type="button"
               onClick={() => {
                 setMobilePickerOpen(false);
+                setMobilePanelAnchor("bottom");
                 setMobileSettingsOpen((open) => !open);
                 setMobileControlsVisible(true);
               }}
