@@ -866,6 +866,17 @@ function preferredChapterChoice(chapters: ChapterSummary[], preferred?: ChapterS
   );
 }
 
+function mergeChapterSummaries(existing: ChapterSummary[], incoming: ChapterSummary[]) {
+  const chapters = new Map<string, ChapterSummary>();
+  for (const chapter of existing) {
+    chapters.set(`${chapter.source}:${chapter.id}`, chapter);
+  }
+  for (const chapter of incoming) {
+    chapters.set(`${chapter.source}:${chapter.id}`, chapter);
+  }
+  return [...chapters.values()];
+}
+
 function groupChaptersByNumber(chapters: ChapterSummary[]) {
   const groups = new Map<string, ChapterGroup & { firstIndex: number }>();
 
@@ -943,6 +954,11 @@ function chapterListLooksPartial(chapters: ChapterSummary[]) {
   return displayedChapterCount(chapters) > groupChaptersByNumber(chapters).length;
 }
 
+function updateKnownChapterSummaries(existing: ChapterSummary[], incoming: ChapterSummary[]) {
+  if (!incoming.length) return existing;
+  return chapterListLooksPartial(incoming) ? mergeChapterSummaries(existing, incoming) : incoming;
+}
+
 function chapterRangeSummary(chapters: ChapterSummary[]) {
   const values = [
     ...new Set(
@@ -1011,17 +1027,32 @@ function isLikelyInternalChapterId(value?: string) {
   return number !== undefined && Number.isInteger(number) && number >= 10000;
 }
 
+function chapterLabelFromStoredId(value?: string) {
+  if (!value) return undefined;
+
+  const numericValue = chapterNumberValue(value);
+  if (numericValue !== undefined) return isLikelyInternalChapterId(value) ? undefined : value;
+
+  const parts = value.split("~");
+  if (parts.length >= 3) {
+    const chapter = decodePathPart(parts[2]);
+    if (chapterNumberValue(chapter) !== undefined) return chapter;
+  }
+
+  const decoded = decodePathPart(value);
+  const match = decoded.match(/(?:^|[^a-z])(?:ch(?:apter)?\.?\s*|chapter[-_\s]*)(\d+(?:\.\d+)?)/i);
+  return match?.[1];
+}
+
 function lastReadLabel(manga: FavoriteManga) {
   if (manga.lastReadChapter) return manga.lastReadChapter;
-  return chapterNumberValue(manga.lastReadChapterId) !== undefined && !isLikelyInternalChapterId(manga.lastReadChapterId)
-    ? manga.lastReadChapterId
-    : undefined;
+  return chapterLabelFromStoredId(manga.lastReadChapterId);
 }
 
 function progressLastReadLabel(progress: ReadingProgress, resolvedChapter?: string) {
   if (progress.chapterNumber) return progress.chapterNumber;
   if (resolvedChapter) return resolvedChapter;
-  return isLikelyInternalChapterId(progress.chapterId) ? undefined : progress.chapterId;
+  return chapterLabelFromStoredId(progress.chapterId);
 }
 
 function normalizedSeriesKey(manga: MangaSummary) {
@@ -3459,8 +3490,10 @@ function ReaderView({
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [chaptersLoading, setChaptersLoading] = useState(true);
+  const [chaptersRefreshing, setChaptersRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [chapterError, setChapterError] = useState("");
+  const chaptersRef = useRef<ChapterSummary[]>([]);
   const loadedPageCount = useRef(0);
   const [resumeScrollPosition, setResumeScrollPosition] = useState<number | undefined>(initialScrollPosition);
   const restoredScrollKey = useRef("");
@@ -3490,6 +3523,11 @@ function ReaderView({
   const [readerPercent, setReaderPercent] = useState(0);
   const [readerTipVisible, setReaderTipVisible] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    chaptersRef.current = [];
+    setChapters([]);
+  }, [source, mangaId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3554,13 +3592,45 @@ function ReaderView({
 
   useEffect(() => {
     let cancelled = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshDelayMs = 15000;
     setChaptersLoading(true);
+    setChaptersRefreshing(false);
     setChapterError("");
-    Promise.all([fetchManga(source, mangaId), fetchChapters(source, mangaId)])
+
+    const scheduleFullRefresh = (currentChapters: ChapterSummary[]) => {
+      if (source !== "comix" || !chapterListLooksPartial(currentChapters)) {
+        setChaptersRefreshing(false);
+        return;
+      }
+      refreshTimer = setTimeout(() => {
+        setChaptersRefreshing(true);
+        fetchChapters(source, mangaId, "en", chapterNumber)
+          .then((refreshed) => {
+            if (cancelled) return;
+            const nextChapters = updateKnownChapterSummaries(chaptersRef.current, refreshed.chapters);
+            chaptersRef.current = nextChapters;
+            setChapters(nextChapters);
+            setChaptersRefreshing(false);
+            if (chapterListLooksPartial(nextChapters)) {
+              scheduleFullRefresh(nextChapters);
+              return;
+            }
+          })
+          .catch(() => {
+            if (!cancelled) setChaptersRefreshing(false);
+          });
+      }, refreshDelayMs);
+    };
+
+    Promise.all([fetchManga(source, mangaId), fetchChapters(source, mangaId, "en", chapterNumber)])
       .then(([mangaResult, chapterResult]) => {
         if (!cancelled) {
           setManga(mangaResult.manga);
-          setChapters(chapterResult.chapters);
+          const nextChapters = updateKnownChapterSummaries(chaptersRef.current, chapterResult.chapters);
+          chaptersRef.current = nextChapters;
+          setChapters(nextChapters);
+          scheduleFullRefresh(nextChapters);
         }
       })
       .catch((err: Error) => {
@@ -3571,8 +3641,9 @@ function ReaderView({
       });
     return () => {
       cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
     };
-  }, [source, mangaId]);
+  }, [source, mangaId, chapterNumber]);
 
   const orderedChapterGroups = useMemo(() => {
     return groupChaptersByNumber(chapters)
@@ -3896,6 +3967,72 @@ function ReaderView({
     onChapterChange(chapter);
   }
 
+  function adjacentChapterFromList(list: ChapterSummary[], direction: "previous" | "next") {
+    const groups = sortChapterGroups(groupChaptersByNumber(list), "chapter-asc");
+    const groupIndex = groups.findIndex((group) =>
+      group.chapters.some((chapter) => chapter.id === chapterId) ||
+      (currentValue !== undefined && group.sortValue === currentValue)
+    );
+    if (groupIndex < 0) return undefined;
+    const adjacentGroup = groups[groupIndex + (direction === "next" ? 1 : -1)];
+    return adjacentGroup ? preferredChapterChoice(adjacentGroup.chapters, currentChapter, chapterId) : undefined;
+  }
+
+  function hasAdjacentGap(candidate?: ChapterSummary) {
+    const candidateValue = chapterNumberValue(candidate?.chapter);
+    if (currentValue === undefined || candidateValue === undefined) return false;
+    return Math.abs(candidateValue - currentValue) > 1.0001;
+  }
+
+  function targetChapterForAdjacentRefresh(direction: "previous" | "next", candidate?: ChapterSummary) {
+    if (currentValue !== undefined && Number.isInteger(currentValue)) {
+      return String(direction === "next" ? currentValue + 1 : Math.max(0, currentValue - 1));
+    }
+    return candidate?.chapter ?? chapterNumber;
+  }
+
+  async function changeAdjacentChapter(direction: "previous" | "next") {
+    const knownChapters = chaptersRef.current.length ? chaptersRef.current : chapters;
+    let candidate = adjacentChapterFromList(knownChapters, direction) ?? (direction === "next" ? nextChapter : previousChapter);
+    const shouldRefreshChapterList = source === "comix" && chapterListLooksPartial(knownChapters);
+    if (!candidate && !shouldRefreshChapterList) {
+      leaveReader();
+      return;
+    }
+
+    if (shouldRefreshChapterList) {
+      const targetChapter = targetChapterForAdjacentRefresh(direction, candidate);
+      setChaptersRefreshing(true);
+      setChapterError("");
+      try {
+        const refreshed = await fetchChapters(source, mangaId, "en", targetChapter);
+        const nextChapters = updateKnownChapterSummaries(chaptersRef.current, refreshed.chapters);
+        chaptersRef.current = nextChapters;
+        setChapters(nextChapters);
+        candidate = adjacentChapterFromList(nextChapters, direction) ?? candidate;
+      } catch (err) {
+        setChapterError(err instanceof Error ? err.message : "Chapter list could not be refreshed.");
+        setChaptersRefreshing(false);
+        return;
+      } finally {
+        setChaptersRefreshing(false);
+      }
+    }
+
+    if (!candidate) {
+      leaveReader();
+      return;
+    }
+
+    if (!hasAdjacentGap(candidate)) {
+      changeChapter(candidate);
+      return;
+    }
+
+    const targetChapter = targetChapterForAdjacentRefresh(direction, candidate);
+    setChapterError(`Chapter ${targetChapter ?? "list"} is still loading. Try again in a moment.`);
+  }
+
   function handlePageLoaded() {
     loadedPageCount.current += 1;
     if (resumeScrollPosition && resumeScrollPosition > 0 && !restoreReady.current && !restoreCancelled.current) {
@@ -3909,7 +4046,7 @@ function ReaderView({
       setPagedPageIndex((index) => Math.max(0, index - step));
       return;
     }
-    if (previousChapter) changeChapter(previousChapter);
+    void changeAdjacentChapter("previous");
   }
 
   function goPagedNext() {
@@ -3919,7 +4056,7 @@ function ReaderView({
       setPagedPageIndex((index) => Math.min(Math.max(0, pageCount - 1), index + step));
       return;
     }
-    if (nextChapter) changeChapter(nextChapter);
+    void changeAdjacentChapter("next");
   }
 
   function toggleMobileControls() {
@@ -4179,7 +4316,7 @@ function ReaderView({
         </div>
         <MobileReaderPanel />
         <div className="reader-mobile-controls" aria-label="Reader controls">
-          <button className="reader-mobile-icon-button" type="button" onClick={() => (previousChapter ? changeChapter(previousChapter) : leaveReader())} aria-label="Previous chapter">
+          <button className="reader-mobile-icon-button" type="button" onClick={() => void changeAdjacentChapter("previous")} disabled={chaptersRefreshing} aria-label="Previous chapter">
             <FontAwesomeIcon icon={faChevronLeft} aria-hidden="true" />
           </button>
           <button
@@ -4194,7 +4331,7 @@ function ReaderView({
             <span>{readerChapterProgressLabel}</span>
             <FontAwesomeIcon icon={faChevronUp} aria-hidden="true" />
           </button>
-          <button className="reader-mobile-icon-button" type="button" onClick={() => (nextChapter ? changeChapter(nextChapter) : leaveReader())} aria-label="Next chapter">
+          <button className="reader-mobile-icon-button" type="button" onClick={() => void changeAdjacentChapter("next")} disabled={chaptersRefreshing} aria-label="Next chapter">
             <FontAwesomeIcon icon={faChevronRight} aria-hidden="true" />
           </button>
           <div className="reader-mobile-tools" aria-label="Reader tools">
@@ -4296,12 +4433,12 @@ function ReaderView({
         </div>
 
         <div className="reader-nav-pair">
-          <button className="reader-nav-button" type="button" onClick={() => (previousChapter ? changeChapter(previousChapter) : leaveReader())}>
+          <button className="reader-nav-button" type="button" onClick={() => void changeAdjacentChapter("previous")} disabled={chaptersRefreshing}>
             <ArrowLeftIcon />
             <span>{previousChapter ? `Previous ${shortChapterLabel(previousChapter)}` : "Previous: title"}</span>
           </button>
-          <button className="reader-nav-button" type="button" onClick={() => (nextChapter ? changeChapter(nextChapter) : leaveReader())}>
-            <span>{nextChapter ? `Next ${shortChapterLabel(nextChapter)}` : "Next: title"}</span>
+          <button className="reader-nav-button" type="button" onClick={() => void changeAdjacentChapter("next")} disabled={chaptersRefreshing}>
+            <span>{chaptersRefreshing ? "Loading chapters..." : nextChapter ? `Next ${shortChapterLabel(nextChapter)}` : "Next: title"}</span>
             <ArrowRightIcon />
           </button>
         </div>
@@ -4360,6 +4497,7 @@ function ReaderView({
       )}
       {loading && <LoadingNotice label="Loading pages" />}
       {error && <div className="notice error">{error}</div>}
+      {!loading && chaptersRefreshing && <LoadingNotice label="Loading more chapters" />}
       {chapterError && <div className="notice error">{chapterError}</div>}
       {!loading && <ReaderControls placement="top" />}
       <section
