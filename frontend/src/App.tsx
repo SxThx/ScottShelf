@@ -3399,7 +3399,7 @@ function DetailView({
       key: "chapters",
       icon: faListUl,
       label: `Chapter list saved in database (${cacheStatus.chapterList.chapters} chapters)`,
-      value: `${cacheStatus.chapterList.chapters} chapters`
+      value: `${cacheStatus.chapterList.chapters}`
     });
   }
   if (cacheStatus?.chapterPages.cached) {
@@ -3407,7 +3407,7 @@ function DetailView({
       key: "pages",
       icon: faImages,
       label: `Chapter page URLs saved in database (${cacheStatus.chapterPages.chapters} chapters, ${cacheStatus.chapterPages.images} images)`,
-      value: `${cacheStatus.chapterPages.chapters} page sets`
+      value: `${cacheStatus.chapterPages.chapters}`
     });
   }
 

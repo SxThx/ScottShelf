@@ -24,6 +24,7 @@ import {
   enqueueBookmarkDownloadsForAll,
   enqueueBookmarkDownloadsForRef,
   enqueueChapterPageDownloadJobsForChapters,
+  enqueueMissingChapterPageDownloadJobsForSavedChapterList,
   failBookmarkDownloadJob,
   getBookmarkUpdateLatest,
   getChapterPageCache,
@@ -44,6 +45,7 @@ import {
   markRecommendationRead,
   removeFavorite,
   removeInteractionBlock,
+  resetStaleBookmarkDownloadJobs,
   resetPassword,
   saveReadingProgress,
   sendRecommendation,
@@ -1054,6 +1056,11 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
     return;
   }
 
+  await enqueueMissingChapterPageDownloadJobsForSavedChapterList(
+    { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+    Math.max(50, job.priority + 1)
+  );
+
   if (!source.getChapterPreview) {
     const chapters = await withTimeout(
       loadAndSaveChapters(source, job.mangaId, job.language),
@@ -1132,11 +1139,14 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
   }
 
   if (job.jobType === "chapter_list") {
-    const chapters = await withTimeout(
-      loadAndSaveChapters(source, job.mangaId, job.language),
-      Number(process.env.BOOKMARK_DOWNLOAD_CHAPTER_LIST_TIMEOUT_MS ?? 120000),
-      `${source.info.name} chapter list download`
-    );
+    const persistent = await getChapterListCache(job.source, job.mangaId, job.language).catch(() => undefined);
+    const chapters = persistent?.chapters?.length
+      ? persistent.chapters
+      : await withTimeout(
+          loadAndSaveChapters(source, job.mangaId, job.language),
+          Number(process.env.BOOKMARK_DOWNLOAD_CHAPTER_LIST_TIMEOUT_MS ?? 120000),
+          `${source.info.name} chapter list download`
+        );
     await upsertBookmarkUpdateCache({
       source: job.source,
       mangaId: job.mangaId,
@@ -1173,12 +1183,15 @@ function startBookmarkDownloadWorker() {
   const intervalMs = Number(process.env.BOOKMARK_DOWNLOAD_INTERVAL_MS ?? 5000);
   const backfillLimit = Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500);
   const latestIntervalMs = Number(process.env.BOOKMARK_LATEST_CHECK_INTERVAL_MS ?? 1000 * 60 * 10);
+  const staleJobTimeoutMs = Number(process.env.BOOKMARK_DOWNLOAD_STALE_JOB_TIMEOUT_MS ?? 1000 * 60 * 20);
   let running = false;
 
   const run = async () => {
     if (running) return;
     running = true;
     try {
+      const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
+      if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
       const jobs = await claimBookmarkDownloadJobs(batchSize, workerId);
       for (const job of jobs) {
         try {

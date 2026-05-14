@@ -1713,6 +1713,10 @@ export async function enqueueBookmarkDownloadsForRef(
 ) {
   await enqueueBookmarkDownloadJob({ jobType: "title_detail", ...ref, priority, refreshExisting });
   await enqueueBookmarkDownloadJob({ jobType: "chapter_list", ...ref, priority, refreshExisting });
+  await enqueueMissingChapterPageDownloadJobsForSavedChapterList(
+    { ...ref, language: "en" },
+    Math.max(50, priority + 1)
+  );
 }
 
 export async function enqueueBookmarkDownloadsForAll(limit = 500) {
@@ -1729,9 +1733,18 @@ export async function enqueueChapterPageDownloadJobsForChapters(
   priority = 50
 ) {
   const maxJobs = Number(process.env.BOOKMARK_DOWNLOAD_MAX_PAGE_JOBS_PER_TITLE ?? 0);
-  const pageChapters = chapters
+  const seen = new Set<string>();
+  const candidateChapters = chapters
     .filter((chapter) => chapter.source && chapter.id)
+    .filter((chapter) => {
+      const key = `${chapter.source}:${chapter.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .slice(0, maxJobs > 0 ? maxJobs : chapters.length);
+  const existingPageKeys = await existingChapterPageKeys(candidateChapters);
+  const pageChapters = candidateChapters.filter((chapter) => !existingPageKeys.has(`${chapter.source}:${chapter.id}`));
 
   for (const chapter of pageChapters) {
     await enqueueBookmarkDownloadJob({
@@ -1748,6 +1761,41 @@ export async function enqueueChapterPageDownloadJobsForChapters(
     });
   }
   return pageChapters.length;
+}
+
+async function existingChapterPageKeys(chapters: ChapterSummary[]) {
+  const db = await getPool();
+  const keys = new Set<string>();
+  const chunkSize = 100;
+  for (let index = 0; index < chapters.length; index += chunkSize) {
+    const chunk = chapters.slice(index, index + chunkSize);
+    if (!chunk.length) continue;
+    const conditions = chunk.map(() => "(source = ? AND chapter_id = ?)").join(" OR ");
+    const params = chunk.flatMap((chapter) => [chapter.source, chapter.id]);
+    const [rows] = await db.query<RowDataPacket[]>(
+      `
+        SELECT source, chapter_id
+        FROM chapter_page_cache
+        WHERE JSON_LENGTH(pages_json) > 0 AND (${conditions})
+      `,
+      params
+    );
+    for (const row of rows) {
+      keys.add(`${String(row.source)}:${String(row.chapter_id)}`);
+    }
+  }
+  return keys;
+}
+
+export async function enqueueMissingChapterPageDownloadJobsForSavedChapterList(
+  ref: { source: string; mangaId: string; canonicalKey?: string; language?: string },
+  priority = 50
+) {
+  const language = ref.language ?? "en";
+  const persistent = await getChapterListCache(ref.source, ref.mangaId, language);
+  const chapters = persistent?.chapters ?? [];
+  if (!chapters.length) return 0;
+  return enqueueChapterPageDownloadJobsForChapters({ ...ref, language }, chapters, priority);
 }
 
 export async function claimBookmarkDownloadJobs(limit: number, workerId: string) {
@@ -1788,6 +1836,33 @@ export async function claimBookmarkDownloadJobs(limit: number, workerId: string)
   } finally {
     connection.release();
   }
+}
+
+export async function resetStaleBookmarkDownloadJobs(timeoutMs: number) {
+  const db = await getPool();
+  const timeoutSeconds = Math.max(Math.floor(timeoutMs / 1000), 60);
+  const [result] = await db.execute<ResultSetHeader>(
+    `
+      UPDATE bookmark_download_jobs
+      SET status = CASE
+          WHEN attempts >= max_attempts THEN 'failed'
+          ELSE 'pending'
+        END,
+        run_after = CURRENT_TIMESTAMP(3),
+        locked_at = NULL,
+        locked_by = NULL,
+        error = CASE
+          WHEN attempts >= max_attempts THEN 'Stale running job exceeded max attempts.'
+          ELSE 'Recovered stale running job for retry.'
+        END,
+        updated_at = CURRENT_TIMESTAMP(3)
+      WHERE status = 'running'
+        AND locked_at IS NOT NULL
+        AND locked_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND)
+    `,
+    [timeoutSeconds]
+  );
+  return result.affectedRows;
 }
 
 export async function completeBookmarkDownloadJob(id: string) {
