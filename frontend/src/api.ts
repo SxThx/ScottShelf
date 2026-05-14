@@ -1,5 +1,6 @@
 import type {
   AccountUser,
+  AdminDashboardStats,
   BookmarkUpdate,
   ChapterPages,
   ChapterSummary,
@@ -7,10 +8,12 @@ import type {
   HomeManga,
   MangaDetail,
   MangaSummary,
+  MemoryCacheStats,
   ReadingProgress,
   Recommendation,
   SourceHealth,
   SourceInfo,
+  TitleCacheStatus,
   UserInteractionBlock,
   UserRole
 } from "./types";
@@ -131,6 +134,10 @@ export async function changeAccountPassword(currentPassword: string, newPassword
 
 export async function fetchUsers() {
   return apiRequest<{ users: AccountUser[] }>("/api/admin/users");
+}
+
+export async function fetchAdminDashboard() {
+  return apiRequest<{ dashboard: AdminDashboardStats; cache: MemoryCacheStats }>("/api/admin/dashboard", { clientCache: "no-store" });
 }
 
 export async function createAccount(username: string, password: string, role: UserRole) {
@@ -324,6 +331,10 @@ export async function fetchManga(source: string, id: string, options: { mirrors?
   const params = new URLSearchParams();
   if (options.mirrors === false) params.set("mirrors", "false");
   return apiRequest<{ manga: MangaDetail }>(`/api/manga/${source}/${id}${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function fetchTitleCacheStatus(source: string, id: string) {
+  return apiRequest<{ cache: TitleCacheStatus }>(`/api/manga/${source}/${id}/cache-status`, { clientCache: "no-store" });
 }
 
 export async function fetchSimilarManga(source: string, id: string) {

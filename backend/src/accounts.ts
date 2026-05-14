@@ -79,6 +79,51 @@ export interface BookmarkDownloadJobRecord {
   maxAttempts: number;
 }
 
+export interface AdminDashboardStats {
+  totals: Record<string, number>;
+  cacheCoverage: {
+    titleDetails: number;
+    chapterLists: number;
+    chapterPageTitles: number;
+    chapterPageRows: number;
+    chapterPageImages: number;
+  };
+  sourceBreakdown: Array<{
+    source: string;
+    titleDetails: number;
+    chapterLists: number;
+    chapterPageTitles: number;
+    chapterPageRows: number;
+    chapterPageImages: number;
+  }>;
+  jobStatus: Array<{ status: string; count: number }>;
+  jobTypes: Array<{ jobType: string; pending: number; running: number; done: number; failed: number; total: number }>;
+  recentActivity: Array<{ label: string; value?: string }>;
+}
+
+export interface TitleCacheStatus {
+  source: string;
+  mangaId: string;
+  titleMetadata: {
+    cached: boolean;
+    compiled: boolean;
+    linked: boolean;
+    checkedAt?: string;
+  };
+  chapterList: {
+    cached: boolean;
+    chapters: number;
+    checkedAt?: string;
+    error?: string;
+  };
+  chapterPages: {
+    cached: boolean;
+    chapters: number;
+    images: number;
+    checkedAt?: string;
+  };
+}
+
 export interface RecommendationInput {
   toUserId: string;
   source: string;
@@ -864,6 +909,219 @@ export async function databaseStatus() {
       bookmarkUpdateCache: Number(bookmarkUpdateCache[0]?.count ?? 0),
       chapterPageCache: Number(chapterPageCache[0]?.count ?? 0),
       bookmarkDownloadJobs: Object.fromEntries(bookmarkDownloadJobs.map((row) => [String(row.status), Number(row.count ?? 0)]))
+    }
+  };
+}
+
+function rowNumber(row: RowDataPacket | undefined, key = "count") {
+  return Number(row?.[key] ?? 0);
+}
+
+function mergeSourceStats(
+  target: Map<string, AdminDashboardStats["sourceBreakdown"][number]>,
+  source: string,
+  values: Partial<Omit<AdminDashboardStats["sourceBreakdown"][number], "source">>
+) {
+  const current =
+    target.get(source) ??
+    {
+      source,
+      titleDetails: 0,
+      chapterLists: 0,
+      chapterPageTitles: 0,
+      chapterPageRows: 0,
+      chapterPageImages: 0
+    };
+  target.set(source, { ...current, ...values });
+}
+
+export async function adminDashboardStats(): Promise<AdminDashboardStats> {
+  const db = await getPool();
+  const [
+    users,
+    favorites,
+    readingProgress,
+    recommendations,
+    unreadRecommendations,
+    interactionBlocks,
+    titleMetadata,
+    compiledTitleCache,
+    metadataLinks,
+    titleChapters,
+    chapterListCache,
+    bookmarkUpdateCache,
+    chapterPageCache,
+    chapterPageTitleCache,
+    chapterPageImages,
+    chapterListSources,
+    titleDetailSources,
+    chapterPageSources,
+    jobStatus,
+    jobTypes,
+    recentTitleDetail,
+    recentChapterList,
+    recentChapterPages,
+    recentBookmarkUpdate
+  ] = await Promise.all([
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM users"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM favorites"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM reading_progress"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM recommendations"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM recommendations WHERE read_at IS NULL"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM user_interaction_blocks"),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM title_metadata").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM compiled_title_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM title_metadata_links").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM title_chapters").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM chapter_list_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM bookmark_update_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM chapter_page_cache").catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>("SELECT COUNT(DISTINCT CONCAT(source, ':', COALESCE(manga_id, ''))) AS count FROM chapter_page_cache WHERE manga_id IS NOT NULL")
+      .catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT COALESCE(SUM(JSON_LENGTH(pages_json)), 0) AS count FROM chapter_page_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT source, COUNT(*) AS chapterLists FROM chapter_list_cache GROUP BY source").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT source, COUNT(*) AS titleDetails FROM compiled_title_cache GROUP BY source").catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>(
+        `
+          SELECT source,
+            COUNT(*) AS chapterPageRows,
+            COUNT(DISTINCT CONCAT(source, ':', COALESCE(manga_id, ''))) AS chapterPageTitles,
+            COALESCE(SUM(JSON_LENGTH(pages_json)), 0) AS chapterPageImages
+          FROM chapter_page_cache
+          GROUP BY source
+        `
+      )
+      .catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT status, COUNT(*) AS count FROM bookmark_download_jobs GROUP BY status").catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>(
+        `
+          SELECT job_type,
+            SUM(status = 'pending') AS pending,
+            SUM(status = 'running') AS running,
+            SUM(status = 'done') AS done,
+            SUM(status = 'failed') AS failed,
+            COUNT(*) AS total
+          FROM bookmark_download_jobs
+          GROUP BY job_type
+          ORDER BY job_type
+        `
+      )
+      .catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(updated_at) AS value FROM compiled_title_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM chapter_list_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM chapter_page_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM bookmark_update_cache").catch(() => [[] as RowDataPacket[]])
+  ]);
+
+  const sourceMap = new Map<string, AdminDashboardStats["sourceBreakdown"][number]>();
+  for (const row of chapterListSources[0]) {
+    mergeSourceStats(sourceMap, String(row.source), { chapterLists: Number(row.chapterLists ?? 0) });
+  }
+  for (const row of titleDetailSources[0]) {
+    mergeSourceStats(sourceMap, String(row.source), { titleDetails: Number(row.titleDetails ?? 0) });
+  }
+  for (const row of chapterPageSources[0]) {
+    mergeSourceStats(sourceMap, String(row.source), {
+      chapterPageRows: Number(row.chapterPageRows ?? 0),
+      chapterPageTitles: Number(row.chapterPageTitles ?? 0),
+      chapterPageImages: Number(row.chapterPageImages ?? 0)
+    });
+  }
+
+  return {
+    totals: {
+      users: rowNumber(users[0][0]),
+      favorites: rowNumber(favorites[0][0]),
+      readingProgress: rowNumber(readingProgress[0][0]),
+      recommendations: rowNumber(recommendations[0][0]),
+      unreadRecommendations: rowNumber(unreadRecommendations[0][0]),
+      interactionBlocks: rowNumber(interactionBlocks[0][0]),
+      titleMetadata: rowNumber(titleMetadata[0][0]),
+      compiledTitleCache: rowNumber(compiledTitleCache[0][0]),
+      metadataLinks: rowNumber(metadataLinks[0][0]),
+      titleChapters: rowNumber(titleChapters[0][0]),
+      chapterListCache: rowNumber(chapterListCache[0][0]),
+      bookmarkUpdateCache: rowNumber(bookmarkUpdateCache[0][0]),
+      chapterPageCache: rowNumber(chapterPageCache[0][0])
+    },
+    cacheCoverage: {
+      titleDetails: rowNumber(compiledTitleCache[0][0]),
+      chapterLists: rowNumber(chapterListCache[0][0]),
+      chapterPageTitles: rowNumber(chapterPageTitleCache[0][0]),
+      chapterPageRows: rowNumber(chapterPageCache[0][0]),
+      chapterPageImages: rowNumber(chapterPageImages[0][0])
+    },
+    sourceBreakdown: [...sourceMap.values()].sort((left, right) => right.chapterPageRows + right.chapterLists - (left.chapterPageRows + left.chapterLists)),
+    jobStatus: jobStatus[0].map((row) => ({ status: String(row.status), count: Number(row.count ?? 0) })),
+    jobTypes: jobTypes[0].map((row) => ({
+      jobType: String(row.job_type),
+      pending: Number(row.pending ?? 0),
+      running: Number(row.running ?? 0),
+      done: Number(row.done ?? 0),
+      failed: Number(row.failed ?? 0),
+      total: Number(row.total ?? 0)
+    })),
+    recentActivity: [
+      { label: "Title detail cache", value: optionalIsoDate(recentTitleDetail[0][0]?.value ?? null) },
+      { label: "Chapter list cache", value: optionalIsoDate(recentChapterList[0][0]?.value ?? null) },
+      { label: "Chapter page cache", value: optionalIsoDate(recentChapterPages[0][0]?.value ?? null) },
+      { label: "Bookmark update cache", value: optionalIsoDate(recentBookmarkUpdate[0][0]?.value ?? null) }
+    ]
+  };
+}
+
+export async function titleCacheStatus(source: string, mangaId: string): Promise<TitleCacheStatus> {
+  const db = await getPool();
+  const [compiledRows] = await db.execute<RowDataPacket[]>(
+    "SELECT updated_at FROM compiled_title_cache WHERE source = ? AND manga_id = ? LIMIT 1",
+    [source, mangaId]
+  );
+  const [linkRows] = await db.execute<RowDataPacket[]>(
+    "SELECT manga_updates_id FROM title_metadata_links WHERE source = ? AND manga_id = ? LIMIT 1",
+    [source, mangaId]
+  );
+  const [chapterRows] = await db.execute<RowDataPacket[]>(
+    "SELECT JSON_LENGTH(chapters_json) AS chapters, checked_at, error FROM chapter_list_cache WHERE source = ? AND manga_id = ? LIMIT 1",
+    [source, mangaId]
+  );
+  const [pageRows] = await db.execute<RowDataPacket[]>(
+    `
+      SELECT COUNT(*) AS chapters, COALESCE(SUM(JSON_LENGTH(pages_json)), 0) AS images, MAX(checked_at) AS checked_at
+      FROM chapter_page_cache
+      WHERE source = ? AND manga_id = ? AND JSON_LENGTH(pages_json) > 0
+    `,
+    [source, mangaId]
+  );
+
+  const compiled = compiledRows[0];
+  const linked = linkRows[0];
+  const chapterList = chapterRows[0];
+  const chapterPages = pageRows[0];
+  const pageChapterCount = Number(chapterPages?.chapters ?? 0);
+
+  return {
+    source,
+    mangaId,
+    titleMetadata: {
+      cached: Boolean(compiled || linked),
+      compiled: Boolean(compiled),
+      linked: Boolean(linked),
+      checkedAt: optionalIsoDate(compiled?.updated_at ?? null)
+    },
+    chapterList: {
+      cached: Boolean(chapterList && Number(chapterList.chapters ?? 0) > 0),
+      chapters: Number(chapterList?.chapters ?? 0),
+      checkedAt: optionalIsoDate(chapterList?.checked_at ?? null),
+      error: chapterList?.error ? String(chapterList.error) : undefined
+    },
+    chapterPages: {
+      cached: pageChapterCount > 0,
+      chapters: pageChapterCount,
+      images: Number(chapterPages?.images ?? 0),
+      checkedAt: optionalIsoDate(chapterPages?.checked_at ?? null)
     }
   };
 }

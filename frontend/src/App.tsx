@@ -17,10 +17,13 @@ import {
   faChevronRight,
   faChevronUp,
   faCompress,
+  faDatabase,
   faEye,
   faEyeSlash,
   faExpand,
   faGear,
+  faImages,
+  faListUl,
   faMagnifyingGlass,
   faQuestionCircle,
   faRightFromBracket,
@@ -37,6 +40,7 @@ import {
   deleteAccount,
   deleteRecommendation,
   fetchAccountBootstrap,
+  fetchAdminDashboard,
   fetchInteractionBlocks,
   fetchChapterPages,
   fetchBookmarkUpdates,
@@ -52,6 +56,7 @@ import {
   fetchSourceHealth,
   fetchSources,
   fetchTaxonomyOptions,
+  fetchTitleCacheStatus,
   fetchUsers,
   getAuthToken,
   importFavorites,
@@ -73,6 +78,7 @@ import { isFavorite } from "./storage";
 import { preloadReaderImages, proxiedImageUrl } from "./lib/images";
 import type {
   AccountUser,
+  AdminDashboardStats,
   BookmarkUpdate,
   ChapterPages,
   ChapterSummary,
@@ -80,10 +86,12 @@ import type {
   HomeManga,
   MangaDetail,
   MangaSummary,
+  MemoryCacheStats,
   ReadingProgress,
   Recommendation,
   SourceHealth,
   SourceInfo,
+  TitleCacheStatus,
   UserInteractionBlock,
   UserRole,
   View
@@ -2267,7 +2275,7 @@ function AccountView({
   onSourcesLoaded: (sources: SourceInfo[]) => void;
   onShareUsersChanged: () => void;
 }) {
-  const [activeTab, setActiveTab] = useState(user.role === "admin" ? "admin" : "settings");
+  const [activeTab, setActiveTab] = useState(user.role === "admin" ? "dashboard" : "settings");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -2328,7 +2336,7 @@ function AccountView({
       .finally(() => setImporting(false));
   }
 
-  const tabs = user.role === "admin" ? ["admin", "settings"] : ["settings"];
+  const tabs = user.role === "admin" ? ["dashboard", "admin", "settings"] : ["settings"];
 
   return (
     <main className="content">
@@ -2344,7 +2352,7 @@ function AccountView({
             type="button"
             onClick={() => setActiveTab(tab)}
           >
-            <span>{tab}</span>
+            <span>{tab === "dashboard" ? "Dashboard" : tab}</span>
           </button>
         ))}
       </div>
@@ -2418,7 +2426,239 @@ function AccountView({
         />
       )}
 
+      {activeTab === "dashboard" && user.role === "admin" && <AdminDashboardView />}
+
     </main>
+  );
+}
+
+function AdminDashboardView() {
+  const [dashboard, setDashboard] = useState<AdminDashboardStats | null>(null);
+  const [memoryCache, setMemoryCache] = useState<MemoryCacheStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const numberFormat = useMemo(() => new Intl.NumberFormat(), []);
+
+  function loadDashboard() {
+    setLoading(true);
+    setError("");
+    fetchAdminDashboard()
+      .then(({ dashboard, cache }) => {
+        setDashboard(dashboard);
+        setMemoryCache(cache);
+      })
+      .catch((err: Error) => setError(err.message))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    loadDashboard();
+  }, []);
+
+  const formatCount = (value?: number) => numberFormat.format(value ?? 0);
+  const chapterWithPagesLabel = (value: number) => `${formatCount(value)} ${value === 1 ? "chapter" : "chapters"} with pages`;
+  const totals = dashboard
+    ? [
+        { label: "Users", value: dashboard.totals.users },
+        { label: "Bookmarks", value: dashboard.totals.favorites },
+        { label: "Reading progress", value: dashboard.totals.readingProgress },
+        { label: "Recommendations", value: dashboard.totals.recommendations },
+        { label: "Unread recs", value: dashboard.totals.unreadRecommendations },
+        { label: "Blocked pairs", value: dashboard.totals.interactionBlocks }
+      ]
+    : [];
+  const cacheBars = dashboard
+    ? [
+        { label: "Title details", value: dashboard.cacheCoverage.titleDetails },
+        { label: "Chapter lists", value: dashboard.cacheCoverage.chapterLists },
+        { label: "Titles with pages", value: dashboard.cacheCoverage.chapterPageTitles },
+        { label: "Chapters with pages", value: dashboard.cacheCoverage.chapterPageRows },
+        { label: "Image URLs", value: dashboard.cacheCoverage.chapterPageImages },
+        { label: "Canonical chapters", value: dashboard.totals.titleChapters },
+        { label: "MU metadata", value: dashboard.totals.titleMetadata },
+        { label: "MU links", value: dashboard.totals.metadataLinks }
+      ]
+    : [];
+  const maxCacheBar = Math.max(1, ...cacheBars.map((item) => item.value));
+  const maxSourceValue = Math.max(
+    1,
+    ...(dashboard?.sourceBreakdown ?? []).map((item) => item.titleDetails + item.chapterLists + item.chapterPageRows)
+  );
+  const maxJobTypeValue = Math.max(1, ...(dashboard?.jobTypes ?? []).map((item) => item.total));
+  const memoryCacheRows = memoryCache
+    ? [
+        { label: "Entries", value: memoryCache.entries },
+        { label: "Fresh", value: memoryCache.fresh },
+        { label: "Stale", value: memoryCache.stale },
+        { label: "Pending", value: memoryCache.pending }
+      ]
+    : [];
+  const memoryCacheTitle = memoryCacheRows.map((item) => `${item.label}: ${formatCount(item.value)}`).join("\n");
+
+  return (
+    <section className="admin-dashboard">
+      <div className="settings-panel-heading dashboard-heading">
+        <div>
+          <h2>Dashboard</h2>
+          <p className="muted-text">DB storage, user activity, memory cache, and bookmark worker health.</p>
+        </div>
+        <button className="small-button" type="button" onClick={loadDashboard} disabled={loading}>
+          {loading ? "Refreshing..." : "Refresh"}
+        </button>
+      </div>
+
+      {error && <div className="notice error">{error}</div>}
+      {loading && !dashboard && <LoadingNotice label="Loading dashboard" />}
+
+      {dashboard && (
+        <>
+          <section className="dashboard-stat-grid" aria-label="Application totals">
+            {totals.map((item) => (
+              <article className="dashboard-stat-card" key={item.label}>
+                <span>{item.label}</span>
+                <strong>{formatCount(item.value)}</strong>
+              </article>
+            ))}
+          </section>
+
+          <section className="dashboard-grid">
+            <article className="settings-panel dashboard-chart-panel">
+              <h3>DB storage coverage</h3>
+              <div className="dashboard-bars">
+                {cacheBars.map((item) => (
+                  <div className="dashboard-bar-row" key={item.label}>
+                    <div>
+                      <span>{item.label}</span>
+                      <strong>{formatCount(item.value)}</strong>
+                    </div>
+                    <span
+                      className="dashboard-bar-track"
+                      title={`${item.label}: ${formatCount(item.value)}\nScaled against ${formatCount(maxCacheBar)}, the largest value in this chart.`}
+                      aria-label={`${item.label}: ${formatCount(item.value)}`}
+                    >
+                      <span style={{ width: `${Math.max(4, (item.value / maxCacheBar) * 100)}%` }} />
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </article>
+
+            <article className="settings-panel dashboard-chart-panel">
+              <h3>Memory cache</h3>
+              <div className="chart-legend" aria-label="Memory cache legend">
+                <span><i className="legend-fresh" />Fresh</span>
+                <span><i className="legend-stale" />Stale</span>
+                <span><i className="legend-pending" />Pending</span>
+              </div>
+              <div className="dashboard-donut-row">
+                <div
+                  className="dashboard-donut"
+                  style={
+                    {
+                      "--fresh": `${memoryCache?.entries ? (memoryCache.fresh / memoryCache.entries) * 100 : 0}%`,
+                      "--stale": `${memoryCache?.entries ? (memoryCache.stale / memoryCache.entries) * 100 : 0}%`
+                    } as CSSProperties
+                  }
+                  title={memoryCacheTitle}
+                  aria-label={memoryCacheTitle}
+                />
+                <div className="dashboard-mini-stats">
+                  {memoryCacheRows.map((item) => (
+                    <div key={item.label} title={`${item.label}: ${formatCount(item.value)}`}>
+                      <span>{item.label}</span>
+                      <strong>{formatCount(item.value)}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </article>
+
+            <article className="settings-panel dashboard-chart-panel dashboard-wide-panel">
+              <h3>DB storage by source</h3>
+              <div className="chart-legend" aria-label="DB storage by source legend">
+                <span><i className="legend-title" />Title details</span>
+                <span><i className="legend-list" />Chapter lists</span>
+                <span><i className="legend-pages" />Chapters with pages</span>
+              </div>
+              <div className="source-breakdown-chart">
+                {dashboard.sourceBreakdown.map((item) => {
+                  const total = item.titleDetails + item.chapterLists + item.chapterPageRows;
+                  return (
+                    <div className="source-breakdown-row" key={item.source}>
+                      <strong>{item.source}</strong>
+                      <div
+                        className="source-breakdown-bars"
+                        aria-label={`${item.source}: ${formatCount(item.titleDetails)} titles, ${formatCount(item.chapterLists)} lists, ${chapterWithPagesLabel(item.chapterPageRows)}, ${formatCount(item.chapterPageImages)} images`}
+                        title={`${item.source}\nTitle details: ${formatCount(item.titleDetails)}\nChapter lists: ${formatCount(item.chapterLists)}\nChapters with pages: ${formatCount(item.chapterPageRows)}\nImage URLs: ${formatCount(item.chapterPageImages)}`}
+                      >
+                        <span className="source-bar-title" title={`Title details: ${formatCount(item.titleDetails)}`} style={{ width: `${Math.max(3, (item.titleDetails / maxSourceValue) * 100)}%` }} />
+                        <span className="source-bar-list" title={`Chapter lists: ${formatCount(item.chapterLists)}`} style={{ width: `${Math.max(3, (item.chapterLists / maxSourceValue) * 100)}%` }} />
+                        <span className="source-bar-pages" title={`Chapters with pages: ${formatCount(item.chapterPageRows)}`} style={{ width: `${Math.max(3, (item.chapterPageRows / maxSourceValue) * 100)}%` }} />
+                      </div>
+                      <span>
+                        {formatCount(item.titleDetails)} titles, {formatCount(item.chapterLists)} lists, {chapterWithPagesLabel(item.chapterPageRows)}, {formatCount(item.chapterPageImages)} images
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              {!dashboard.sourceBreakdown.length && <div className="notice">No DB storage rows yet.</div>}
+            </article>
+
+            <article className="settings-panel dashboard-chart-panel dashboard-wide-panel">
+              <h3>Bookmark worker jobs</h3>
+              <div className="chart-legend" aria-label="Bookmark worker jobs legend">
+                <span><i className="legend-pending" />Pending</span>
+                <span><i className="legend-running" />Running</span>
+                <span><i className="legend-done" />Done</span>
+                <span><i className="legend-failed" />Failed</span>
+              </div>
+              <div className="job-status-pills">
+                {dashboard.jobStatus.map((item) => (
+                  <span key={item.status}>
+                    {item.status}: <strong>{formatCount(item.count)}</strong>
+                  </span>
+                ))}
+              </div>
+              <div className="job-type-chart">
+                {dashboard.jobTypes.map((item) => (
+                  <div className="job-type-row" key={item.jobType}>
+                    <strong>{item.jobType.replace(/_/g, " ")}</strong>
+                    <div
+                      className="job-type-stack"
+                      aria-label={`${item.jobType} jobs`}
+                      title={`${item.jobType.replace(/_/g, " ")}\nPending: ${formatCount(item.pending)}\nRunning: ${formatCount(item.running)}\nDone: ${formatCount(item.done)}\nFailed: ${formatCount(item.failed)}\nTotal: ${formatCount(item.total)}`}
+                    >
+                      {(["pending", "running", "done", "failed"] as const).map((status) => (
+                        <span
+                          key={status}
+                          className={`job-segment job-segment-${status}`}
+                          style={{ width: `${Math.max(item[status] ? 3 : 0, (item[status] / maxJobTypeValue) * 100)}%` }}
+                          title={`${status}: ${formatCount(item[status])}`}
+                        />
+                      ))}
+                    </div>
+                    <span>{formatCount(item.total)}</span>
+                  </div>
+                ))}
+              </div>
+            </article>
+
+            <article className="settings-panel dashboard-chart-panel">
+              <h3>Recent DB writes</h3>
+              <div className="recent-cache-list">
+                {dashboard.recentActivity.map((item) => (
+                  <div key={item.label}>
+                    <span>{item.label}</span>
+                    <strong>{item.value ? displayMetadataDate(item.value) : "None"}</strong>
+                  </div>
+                ))}
+              </div>
+            </article>
+          </section>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -2659,7 +2899,7 @@ function AdminView({
 	      </section>
 
       <section className="admin-layout">
-        <form className="settings-panel" onSubmit={submitCreate}>
+        <form className="settings-panel admin-create-panel" onSubmit={submitCreate}>
           <h2>Create account</h2>
           {message && <div className="notice success">{message}</div>}
           {error && <div className="notice error">{error}</div>}
@@ -2812,7 +3052,7 @@ function AdminView({
           </div>
         </section>
 
-        <section className="settings-panel">
+        <section className="settings-panel admin-interaction-panel">
           <h2>User interaction</h2>
           <p className="muted-text">Disabled pairs cannot see each other in Share, and recommendation requests are blocked both ways.</p>
           <form className="interaction-block-form" onSubmit={submitInteractionBlock}>
@@ -2907,6 +3147,35 @@ function DetailView({
   const [shareError, setShareError] = useState("");
   const [shareLoading, setShareLoading] = useState(false);
   const [nsfwShareUserId, setNsfwShareUserId] = useState("");
+  const [cacheStatus, setCacheStatus] = useState<TitleCacheStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCacheStatus(null);
+    fetchTitleCacheStatus(source, id)
+      .then(({ cache }) => {
+        if (!cancelled) setCacheStatus(cache);
+      })
+      .catch(() => {
+        if (!cancelled) setCacheStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, id]);
+
+  useEffect(() => {
+    if (loading || chaptersLoading || chapterRefreshPending) return;
+    let cancelled = false;
+    fetchTitleCacheStatus(source, id)
+      .then(({ cache }) => {
+        if (!cancelled) setCacheStatus(cache);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [source, id, loading, chaptersLoading, chapterRefreshPending, chapters.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3116,6 +3385,31 @@ function DetailView({
     : undefined;
   const titleIsNsfw = isNsfw(manga);
   const eligibleShareUsers = titleIsNsfw ? shareUsers.filter((item) => item.nsfwAllowed) : shareUsers;
+  const cacheBadges: Array<{ key: string; icon: typeof faDatabase; label: string; value?: string }> = [];
+  if (cacheStatus?.titleMetadata.cached) {
+    cacheBadges.push({
+      key: "metadata",
+      icon: faDatabase,
+      label: "Title metadata saved in database",
+      value: cacheStatus.titleMetadata.checkedAt ? `Updated ${displayMetadataDate(cacheStatus.titleMetadata.checkedAt)}` : undefined
+    });
+  }
+  if (cacheStatus?.chapterList.cached) {
+    cacheBadges.push({
+      key: "chapters",
+      icon: faListUl,
+      label: `Chapter list saved in database (${cacheStatus.chapterList.chapters} chapters)`,
+      value: `${cacheStatus.chapterList.chapters} chapters`
+    });
+  }
+  if (cacheStatus?.chapterPages.cached) {
+    cacheBadges.push({
+      key: "pages",
+      icon: faImages,
+      label: `Chapter page URLs saved in database (${cacheStatus.chapterPages.chapters} chapters, ${cacheStatus.chapterPages.images} images)`,
+      value: `${cacheStatus.chapterPages.chapters} page sets`
+    });
+  }
 
 	  function ChapterPagination() {
     if (!showChapterPagination) return null;
@@ -3269,6 +3563,16 @@ function DetailView({
 
         <article className="title-info">
           <h1>{displayTitle}</h1>
+          {cacheBadges.length > 0 && (
+            <div className="title-cache-badges" aria-label="Database storage status">
+              {cacheBadges.map((badge) => (
+                <span className="title-cache-badge" key={badge.key} title={badge.label} aria-label={badge.label}>
+                  <FontAwesomeIcon icon={badge.icon} aria-hidden="true" />
+                  <span>{badge.value ?? "Saved"}</span>
+                </span>
+              ))}
+            </div>
+          )}
           <TitleRating manga={manga} />
           {otherNames.length > 0 && (
             <section className="title-detail-section known-names-block">

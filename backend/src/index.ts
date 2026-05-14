@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   authenticate,
   addInteractionBlock,
+  adminDashboardStats,
   changePassword,
   addFavorite,
   claimBookmarkDownloadJobs,
@@ -47,6 +48,7 @@ import {
   saveReadingProgress,
   sendRecommendation,
   setUserNsfwAllowed,
+  titleCacheStatus,
   upsertChapterListCache,
   upsertChapterPageCache,
   upsertBookmarkUpdateCache,
@@ -1340,6 +1342,14 @@ app.get(
   })
 );
 
+app.get(
+  "/api/admin/dashboard",
+  asyncRoute(async (req, res) => {
+    if (!(await requireAdmin(req, res))) return;
+    res.json({ dashboard: await adminDashboardStats(), cache: cacheStats() });
+  })
+);
+
 app.post(
   "/api/admin/users",
   asyncRoute(async (req, res) => {
@@ -1761,6 +1771,15 @@ app.get(
     const source = sourceOr404(req.params.source);
     const manga = await getSimilarTitles(source, req.params.id);
     res.json({ manga });
+  })
+);
+
+app.get(
+  "/api/manga/:source/:id/cache-status",
+  asyncRoute(async (req, res) => {
+    sourceOr404(req.params.source);
+    publicCache(res, 60);
+    res.json({ cache: await titleCacheStatus(req.params.source, req.params.id) });
   })
 );
 

@@ -18,6 +18,58 @@ export interface SourceHealth {
   error?: string;
 }
 
+export interface AdminDashboardStats {
+  totals: Record<string, number>;
+  cacheCoverage: {
+    titleDetails: number;
+    chapterLists: number;
+    chapterPageTitles: number;
+    chapterPageRows: number;
+    chapterPageImages: number;
+  };
+  sourceBreakdown: Array<{
+    source: string;
+    titleDetails: number;
+    chapterLists: number;
+    chapterPageTitles: number;
+    chapterPageRows: number;
+    chapterPageImages: number;
+  }>;
+  jobStatus: Array<{ status: string; count: number }>;
+  jobTypes: Array<{ jobType: string; pending: number; running: number; done: number; failed: number; total: number }>;
+  recentActivity: Array<{ label: string; value?: string }>;
+}
+
+export interface MemoryCacheStats {
+  entries: number;
+  fresh: number;
+  stale: number;
+  pending: number;
+}
+
+export interface TitleCacheStatus {
+  source: string;
+  mangaId: string;
+  titleMetadata: {
+    cached: boolean;
+    compiled: boolean;
+    linked: boolean;
+    checkedAt?: string;
+  };
+  chapterList: {
+    cached: boolean;
+    chapters: number;
+    checkedAt?: string;
+    error?: string;
+  };
+  chapterPages: {
+    cached: boolean;
+    chapters: number;
+    images: number;
+    checkedAt?: string;
+  };
+}
+
 export interface MangaSummary {
   source: string;
   id: string;
