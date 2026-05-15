@@ -105,19 +105,38 @@ type ComixPage = {
 };
 
 function comixPageUrls(value: unknown): string[] {
+  const pageUrl = (page: unknown, baseUrl?: string) => {
+    const raw =
+      typeof page === "string"
+        ? page
+        : page && typeof page === "object"
+          ? String(
+              (page as Record<string, unknown>).url ??
+                (page as Record<string, unknown>).src ??
+                (page as Record<string, unknown>).image ??
+                (page as Record<string, unknown>).image_url ??
+                (page as Record<string, unknown>).imageUrl ??
+                ""
+            )
+          : "";
+    if (!raw) return "";
+    if (!baseUrl || /^https?:\/\//i.test(raw)) return raw;
+    try {
+      return new URL(raw, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+    } catch {
+      return raw;
+    }
+  };
+
   if (!value) return [];
   if (Array.isArray(value)) {
-    return value
-      .map((page) => {
-        if (typeof page === "string") return page;
-        if (!page || typeof page !== "object") return "";
-        const record = page as Record<string, unknown>;
-        return String(record.url ?? record.src ?? record.image ?? record.image_url ?? record.imageUrl ?? "");
-      })
-      .filter(Boolean);
+    return value.map((page) => pageUrl(page)).filter(Boolean);
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
+    const baseUrl = typeof record.baseUrl === "string" ? record.baseUrl : typeof record.base_url === "string" ? record.base_url : undefined;
+    const nested = record.items ?? record.data ?? record.pages;
+    if (Array.isArray(nested)) return nested.map((page) => pageUrl(page, baseUrl)).filter(Boolean);
     return comixPageUrls(record.items ?? record.data ?? record.pages ?? Object.values(record));
   }
   return [];
@@ -1192,12 +1211,26 @@ function browserChapterPagesExpression(chapterId: string) {
         };
 
         const result = unwrap(await api.get("/chapters/" + ${JSON.stringify(chapterId)}));
+        const pageUrl = (page, baseUrl = "") => {
+          const raw = typeof page === "string" ? page : page?.url ?? page?.src ?? page?.image ?? page?.image_url ?? page?.imageUrl ?? "";
+          if (!raw) return "";
+          if (!baseUrl || /^https?:\\/\\//i.test(raw)) return raw;
+          try {
+            return new URL(raw, baseUrl.endsWith("/") ? baseUrl : baseUrl + "/").toString();
+          } catch {
+            return raw;
+          }
+        };
+        if (result?.pages && !Array.isArray(result.pages) && Array.isArray(result.pages.items)) {
+          const pages = result.pages.items.map((page) => pageUrl(page, result.pages.baseUrl ?? result.pages.base_url)).filter(Boolean);
+          if (pages.length) return pages;
+        }
         if (Array.isArray(result?.pages)) {
-          const pages = result.pages.map((page) => page.url).filter(Boolean);
+          const pages = result.pages.map((page) => pageUrl(page)).filter(Boolean);
           if (pages.length) return pages;
         }
         if (Array.isArray(result)) {
-          const pages = result.map((page) => page?.url).filter(Boolean);
+          const pages = result.map((page) => pageUrl(page)).filter(Boolean);
           if (pages.length) return pages;
         }
       }
