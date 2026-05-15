@@ -692,6 +692,20 @@ function mergedLegacyTags(metadata: StoredMetadata, base: MangaDetail) {
   return uniqueStrings([...metadata.tags, ...metadata.categories, ...(base.genres ?? []), ...(base.categories ?? []), ...base.tags]).slice(0, 96);
 }
 
+function isMangaUpdatesCover(url?: string) {
+  if (!url) return false;
+  try {
+    return new URL(url).hostname.endsWith("mangaupdates.com");
+  } catch {
+    return url.includes("mangaupdates.com");
+  }
+}
+
+function mergedCoverUrl(base: MangaDetail, metadata: StoredMetadata) {
+  if (base.coverUrl && isMangaUpdatesCover(metadata.coverUrl)) return base.coverUrl;
+  return metadata.coverUrl || base.coverUrl;
+}
+
 function mergeMetadata(base: MangaDetail, metadata: StoredMetadata): MangaDetail {
   const genres = mergedGenres(metadata, base);
   const categories = mergedCategories(metadata, base);
@@ -700,7 +714,7 @@ function mergeMetadata(base: MangaDetail, metadata: StoredMetadata): MangaDetail
     canonicalKey: `mu:${metadata.mangaUpdatesId}`,
     title: metadata.title || base.title,
     description: cleanSynopsis(metadata.description || base.description),
-    coverUrl: metadata.coverUrl || base.coverUrl,
+    coverUrl: mergedCoverUrl(base, metadata),
     status: normalizeStatus(metadata.status || base.status),
     contentRating: base.contentRating || sanitizedContentRating(metadata.contentRating, uniqueStrings([...genres, ...categories])),
     demographic: metadata.type || base.demographic,

@@ -313,7 +313,7 @@ function termTitles(terms?: ComixTerm[]) {
 }
 
 function coverUrl(manga: ComixManga) {
-  return manga.poster?.medium ?? manga.poster?.large ?? manga.poster?.small;
+  return manga.poster?.large ?? manga.poster?.medium ?? manga.poster?.small;
 }
 
 function relativeTimeToIso(value?: string) {
