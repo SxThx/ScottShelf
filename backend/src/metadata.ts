@@ -702,7 +702,9 @@ function isMangaUpdatesCover(url?: string) {
 }
 
 function mergedCoverUrl(base: MangaDetail, metadata: StoredMetadata) {
-  if (base.coverUrl && isMangaUpdatesCover(metadata.coverUrl)) return base.coverUrl;
+  if (isMangaUpdatesCover(metadata.coverUrl)) {
+    return base.coverUrl && !isMangaUpdatesCover(base.coverUrl) ? base.coverUrl : undefined;
+  }
   return metadata.coverUrl || base.coverUrl;
 }
 
@@ -749,7 +751,7 @@ function detailFromStoredMetadata(source: string, mangaId: string, metadata: Sto
     canonicalKey: `mu:${metadata.mangaUpdatesId}`,
     title: metadata.title,
     description: cleanSynopsis(metadata.description),
-    coverUrl: metadata.coverUrl,
+    coverUrl: isMangaUpdatesCover(metadata.coverUrl) ? undefined : metadata.coverUrl,
     status: normalizeStatus(metadata.status),
     contentRating: sanitizedContentRating(metadata.contentRating, tags),
     demographic: metadata.type,
