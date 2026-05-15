@@ -1181,37 +1181,68 @@ function startBookmarkDownloadWorker() {
   const workerId = `scottshelf-${process.pid}`;
   const batchSize = Number(process.env.BOOKMARK_DOWNLOAD_BATCH_SIZE ?? 1);
   const intervalMs = Number(process.env.BOOKMARK_DOWNLOAD_INTERVAL_MS ?? 5000);
+  const workerConcurrency = Math.max(Math.min(Number(process.env.BOOKMARK_DOWNLOAD_WORKER_CONCURRENCY ?? 1) || 1, 16), 1);
   const backfillLimit = Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500);
   const latestIntervalMs = Number(process.env.BOOKMARK_LATEST_CHECK_INTERVAL_MS ?? 1000 * 60 * 10);
   const staleJobTimeoutMs = Number(process.env.BOOKMARK_DOWNLOAD_STALE_JOB_TIMEOUT_MS ?? 1000 * 60 * 20);
-  let running = false;
 
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
-      const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
-      if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
-      const jobs = await claimBookmarkDownloadJobs(batchSize, workerId);
-      for (const job of jobs) {
-        try {
-          await processBookmarkDownloadJob(job);
-          await completeBookmarkDownloadJob(job.id);
-        } catch (error) {
-          await failBookmarkDownloadJob(job, error);
-        }
+  const createWorkerRun = (lane: number) => {
+    const laneWorkerId = workerConcurrency > 1 ? `${workerId}-${lane}` : workerId;
+    let running = false;
+    return async () => {
+      if (running) return;
+      running = true;
+      try {
+        const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
+        if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
+        const jobs = await claimBookmarkDownloadJobs(batchSize, laneWorkerId);
+        await Promise.all(jobs.map(async (job) => {
+          try {
+            await processBookmarkDownloadJob(job);
+            await completeBookmarkDownloadJob(job.id);
+          } catch (error) {
+            await failBookmarkDownloadJob(job, error);
+          }
+        }));
+      } catch (error) {
+        console.warn("Bookmark download worker failed:", error instanceof Error ? error.message : String(error));
+      } finally {
+        running = false;
       }
-    } catch (error) {
-      console.warn("Bookmark download worker failed:", error instanceof Error ? error.message : String(error));
-    } finally {
-      running = false;
+    };
+  };
+
+  const startWorkerLane = (lane: number) => {
+    const run = createWorkerRun(lane);
+    const staggerMs = Math.min(intervalMs, 1000) * lane;
+    setTimeout(run, 8000 + staggerMs);
+    setInterval(run, intervalMs);
+  };
+
+  for (let lane = 0; lane < workerConcurrency; lane += 1) {
+    startWorkerLane(lane);
+  }
+
+  console.log(
+    `Bookmark download worker started: concurrency=${workerConcurrency}, batchSize=${Math.max(Math.min(Math.floor(batchSize), 25), 1)}, intervalMs=${intervalMs}`
+  );
+
+  const runInitialFanout = async () => {
+    const refs = await listFavoriteRefs(backfillLimit);
+    let queuedPageJobs = 0;
+    for (const ref of refs) {
+      await enqueueBookmarkDownloadsForRef(ref);
+      queuedPageJobs += await enqueueMissingChapterPageDownloadJobsForSavedChapterList({ ...ref, language: "en" });
     }
+    return { titles: refs.length, queuedPageJobs };
   };
 
   if (process.env.BOOKMARK_DOWNLOAD_BACKFILL_ON_START !== "0") {
     setTimeout(() => {
-      enqueueBookmarkDownloadsForAll(backfillLimit)
-        .then((count) => console.log(`Bookmark download backfill queued ${count} titles.`))
+      runInitialFanout()
+        .then(({ titles, queuedPageJobs }) =>
+          console.log(`Bookmark download backfill queued ${titles} titles and ${queuedPageJobs} saved-list page jobs.`)
+        )
         .catch((error: Error) => console.warn("Bookmark download backfill failed:", error.message));
     }, 5000);
   }
@@ -1223,9 +1254,6 @@ function startBookmarkDownloadWorker() {
         .catch((error: Error) => console.warn("Bookmark latest check queue failed:", error.message));
     }, latestIntervalMs);
   }
-
-  setTimeout(run, 8000);
-  setInterval(run, intervalMs);
 }
 
 function progressInput(value: unknown) {
@@ -1901,12 +1929,19 @@ initializeAccounts()
       await initializeMetadataTables();
 	    console.log(`MySQL ready at ${databaseLabel()}`);
 	    console.log("Ensured tables: users, favorites, reading_progress, recommendations, title_metadata");
-      startMetadataRefreshCron();
-	    startCacheWarmer();
+      const workerOnly = process.env.SCOTTSHELF_WORKER_ONLY === "1";
+      if (!workerOnly) {
+        startMetadataRefreshCron();
+	      startCacheWarmer();
+      }
       startBookmarkDownloadWorker();
-    app.listen(port, () => {
-      console.log(`ScottShelf API listening on http://localhost:${port}`);
-    });
+      if (workerOnly) {
+        console.log("ScottShelf bookmark worker-only process started.");
+        return;
+      }
+      app.listen(port, () => {
+        console.log(`ScottShelf API listening on http://localhost:${port}`);
+      });
   })
   .catch((error: Error) => {
     console.error("Failed to initialize MySQL account system:", error.message);
