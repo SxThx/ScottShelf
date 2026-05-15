@@ -1193,8 +1193,10 @@ function startBookmarkDownloadWorker() {
       if (running) return;
       running = true;
       try {
-        const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
-        if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
+        if (lane === 0) {
+          const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
+          if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
+        }
         const jobs = await claimBookmarkDownloadJobs(batchSize, laneWorkerId);
         await Promise.all(jobs.map(async (job) => {
           try {
