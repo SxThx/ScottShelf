@@ -1214,7 +1214,7 @@ function browserChapterPagesExpression(chapterId: string) {
         const pageUrl = (page, baseUrl = "") => {
           const raw = typeof page === "string" ? page : page?.url ?? page?.src ?? page?.image ?? page?.image_url ?? page?.imageUrl ?? "";
           if (!raw) return "";
-          if (!baseUrl || /^https?:\\/\\//i.test(raw)) return raw;
+          if (!baseUrl || raw.startsWith("http://") || raw.startsWith("https://")) return raw;
           try {
             return new URL(raw, baseUrl.endsWith("/") ? baseUrl : baseUrl + "/").toString();
           } catch {
