@@ -486,7 +486,7 @@ const renderedBrowserQueue: Array<() => void> = [];
 let activeRenderedBrowsers = 0;
 
 async function acquireRenderedBrowserSlot() {
-  const limit = Math.max(1, Math.min(8, Number(process.env.COMIX_RENDERED_BROWSER_CONCURRENCY ?? 1) || 1));
+  const limit = Math.max(1, Math.min(16, Number(process.env.COMIX_RENDERED_BROWSER_CONCURRENCY ?? 1) || 1));
   if (activeRenderedBrowsers < limit) {
     activeRenderedBrowsers += 1;
     return () => releaseRenderedBrowserSlot();
