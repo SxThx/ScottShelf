@@ -1163,7 +1163,7 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
 
   if (job.jobType === "chapter_pages") {
     if (!job.chapterId) throw new Error("Chapter page download job is missing chapter id.");
-    await withTimeout(
+    const pages = await withTimeout(
       loadAndSaveChapterPages(source, job.chapterId, {
         mangaId: job.mangaId,
         chapterNumber: job.chapterNumber,
@@ -1172,7 +1172,10 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
       Number(process.env.BOOKMARK_DOWNLOAD_PAGES_TIMEOUT_MS ?? 60000),
       `${source.info.name} chapter page download`
     );
+    return { pages: pages.pages.length };
   }
+
+  return {};
 }
 
 function startBookmarkDownloadWorker() {
@@ -1185,6 +1188,11 @@ function startBookmarkDownloadWorker() {
   const backfillLimit = Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500);
   const latestIntervalMs = Number(process.env.BOOKMARK_LATEST_CHECK_INTERVAL_MS ?? 1000 * 60 * 10);
   const staleJobTimeoutMs = Number(process.env.BOOKMARK_DOWNLOAD_STALE_JOB_TIMEOUT_MS ?? 1000 * 60 * 20);
+  const progressLog = process.env.BOOKMARK_DOWNLOAD_PROGRESS_LOG === "1";
+  const progressIntervalMs = Number(process.env.BOOKMARK_DOWNLOAD_PROGRESS_INTERVAL_MS ?? 30000);
+
+  const jobLabel = (job: BookmarkDownloadJobRecord) =>
+    `${job.jobType} ${job.source}:${job.mangaId}${job.chapterNumber ? ` ch.${job.chapterNumber}` : ""}${job.chapterId ? ` ${job.chapterId}` : ""}`;
 
   const createWorkerRun = (lane: number) => {
     const laneWorkerId = workerConcurrency > 1 ? `${workerId}-${lane}` : workerId;
@@ -1199,11 +1207,23 @@ function startBookmarkDownloadWorker() {
         }
         const jobs = await claimBookmarkDownloadJobs(batchSize, laneWorkerId);
         await Promise.all(jobs.map(async (job) => {
+          const startedAt = Date.now();
           try {
-            await processBookmarkDownloadJob(job);
+            const result = await processBookmarkDownloadJob(job);
             await completeBookmarkDownloadJob(job.id);
+            if (progressLog) {
+              const pages = result?.pages !== undefined ? ` pages=${result.pages}` : "";
+              console.log(`[bookmark-worker:${lane}] done ${jobLabel(job)}${pages} in ${Date.now() - startedAt}ms`);
+            }
           } catch (error) {
             await failBookmarkDownloadJob(job, error);
+            if (progressLog) {
+              console.warn(
+                `[bookmark-worker:${lane}] failed ${jobLabel(job)} in ${Date.now() - startedAt}ms: ${
+                  error instanceof Error ? error.message : String(error)
+                }`
+              );
+            }
           }
         }));
       } catch (error) {
@@ -1228,6 +1248,19 @@ function startBookmarkDownloadWorker() {
   console.log(
     `Bookmark download worker started: concurrency=${workerConcurrency}, batchSize=${Math.max(Math.min(Math.floor(batchSize), 25), 1)}, intervalMs=${intervalMs}`
   );
+
+  if (progressLog && progressIntervalMs > 0) {
+    setInterval(() => {
+      adminDashboardStats()
+        .then((stats) => {
+          const pages = stats.jobTypes.find((item) => item.jobType === "chapter_pages");
+          console.log(
+            `[bookmark-worker] progress chapter_pages pending=${pages?.pending ?? 0} running=${pages?.running ?? 0} done=${pages?.done ?? 0} failed=${pages?.failed ?? 0}; db_page_sets=${stats.cacheCoverage.chapterPageRows} image_urls=${stats.cacheCoverage.chapterPageImages}`
+          );
+        })
+        .catch((error: Error) => console.warn("[bookmark-worker] progress check failed:", error.message));
+    }, progressIntervalMs);
+  }
 
   const runInitialFanout = async () => {
     const refs = await listFavoriteRefs(backfillLimit);
