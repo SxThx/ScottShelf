@@ -104,6 +104,25 @@ type ComixPage = {
   url: string;
 };
 
+function comixPageUrls(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map((page) => {
+        if (typeof page === "string") return page;
+        if (!page || typeof page !== "object") return "";
+        const record = page as Record<string, unknown>;
+        return String(record.url ?? record.src ?? record.image ?? record.image_url ?? record.imageUrl ?? "");
+      })
+      .filter(Boolean);
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return comixPageUrls(record.items ?? record.data ?? record.pages ?? Object.values(record));
+  }
+  return [];
+}
+
 type RenderedComixChapter = {
   href?: string;
   chapterId?: string;
@@ -1703,8 +1722,8 @@ export const comixSource: MangaSource = {
     const cacheKey = `chapter:${decoded.chapterId}`;
     const matcher = (url: string) => url.includes(`/api/v1/chapters/${decoded.chapterId}?`);
     const signedUrl = await captureSignedUrl(cacheKey, referer, matcher);
-    const chapter = await signedJson<ComixChapter & { pages?: ComixPage[] }>(signedUrl, referer);
-    const pages = (chapter.pages ?? []).map((page) => page.url).filter(Boolean);
+    const chapter = await signedJson<ComixChapter & { pages?: ComixPage[] | Record<string, unknown> }>(signedUrl, referer);
+    const pages = comixPageUrls(chapter.pages);
     if (!pages.length) throw new Error("Comix.to did not return chapter pages.");
     return {
       source: "comix",
