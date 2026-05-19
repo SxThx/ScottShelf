@@ -35,9 +35,38 @@ export interface AdminDashboardStats {
     chapterPageRows: number;
     chapterPageImages: number;
   }>;
+  userBookmarks: Array<{
+    userId: string;
+    username: string;
+    bookmarks: number;
+  }>;
+  userActivity: Array<{
+    userId: string;
+    username: string;
+    lastActiveAt?: string;
+    lastReadTitle?: string;
+    lastReadChapter?: string;
+    lastReadSource?: string;
+    lastReadMangaId?: string;
+  }>;
   jobStatus: Array<{ status: string; count: number }>;
   jobTypes: Array<{ jobType: string; pending: number; running: number; done: number; failed: number; total: number }>;
+  jobActivity: {
+    latestCheckLastCompletedAt?: string;
+    latestCheckNextQueuedAt?: string;
+    latestChaptersLastCompletedAt?: string;
+    workerLastCompletedAt?: string;
+  };
   recentActivity: Array<{ label: string; value?: string }>;
+  refreshSchedules?: Array<{
+    key: string;
+    label: string;
+    status: string;
+    lastRefreshedAt?: string;
+    nextRefreshAt?: string;
+    intervalMs?: number;
+    detail?: string;
+  }>;
 }
 
 export interface MemoryCacheStats {
@@ -130,6 +159,51 @@ export interface ChapterPages {
   source: string;
   id: string;
   pages: string[];
+}
+
+export type CommentSort = "best" | "newest" | "oldest";
+
+export interface CommentUser {
+  id?: string;
+  name?: string;
+  avatarUrl?: string;
+}
+
+export interface CommentItem {
+  id: string;
+  parentId?: string;
+  user?: CommentUser;
+  contentHtml: string;
+  likeCount?: number;
+  dislikeCount?: number;
+  replyCount?: number;
+  isPinned?: boolean;
+  isEdited?: boolean;
+  createdAt?: string;
+  createdAtFormatted?: string;
+  replies: CommentItem[];
+}
+
+export interface CommentThread {
+  id: string;
+  key: string;
+  pageUrl?: string;
+  pageTitle?: string;
+  commentCount?: number;
+  mainCommentCount?: number;
+  isClosed?: boolean;
+}
+
+export interface CommentPage {
+  source: string;
+  targetType: "title" | "chapter";
+  mangaId: string;
+  chapterNumber?: string;
+  volume?: string;
+  thread: CommentThread;
+  comments: CommentItem[];
+  sort: CommentSort;
+  cursor?: string;
 }
 
 export interface FavoriteManga extends MangaSummary {

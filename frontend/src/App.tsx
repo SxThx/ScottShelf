@@ -12,10 +12,14 @@ import {
   faArrowLeft,
   faArrowRight,
   faArrowUp,
+  faAnglesLeft,
+  faAnglesRight,
   faCircleExclamation,
+  faChevronDown,
   faChevronLeft,
   faChevronRight,
   faChevronUp,
+  faCommentDots,
   faCompress,
   faDatabase,
   faEye,
@@ -27,9 +31,11 @@ import {
   faMagnifyingGlass,
   faQuestionCircle,
   faRightFromBracket,
-  faStar as solidStar
+  faSlash,
+  faStar as solidStar,
+  faXmark
 } from "@fortawesome/free-solid-svg-icons";
-import { type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode, type TouchEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode, type TouchEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   changeAccountPassword,
   clearRecommendations,
@@ -42,6 +48,7 @@ import {
   fetchAccountBootstrap,
   fetchAdminDashboard,
   fetchInteractionBlocks,
+  fetchChapterComments,
   fetchChapterPages,
   fetchBookmarkUpdates,
   fetchChapters,
@@ -56,6 +63,7 @@ import {
   fetchSourceHealth,
   fetchSources,
   fetchTaxonomyOptions,
+  fetchTitleComments,
   fetchTitleCacheStatus,
   fetchUsers,
   getAuthToken,
@@ -80,6 +88,8 @@ import type {
   AccountUser,
   AdminDashboardStats,
   BookmarkUpdate,
+  CommentItem,
+  CommentPage,
   ChapterPages,
   ChapterSummary,
   FavoriteManga,
@@ -121,12 +131,6 @@ interface ActiveReaderPosition {
   chapterId: string;
   chapterNumber?: string;
   scrollPosition: number;
-}
-
-interface ComickImportResult {
-  favorites: MangaSummary[];
-  progress: Array<{ source: string; mangaId: string; chapterId: string; chapterNumber?: string }>;
-  unresolved: number;
 }
 
 interface ReadingHistoryItem {
@@ -472,7 +476,7 @@ function taxonomyTerms(manga: MangaSummary) {
 function displayCommunityRating(manga: MangaSummary) {
   if (typeof manga.communityRating !== "number") return undefined;
   const rating = manga.communityRating.toFixed(2).replace(/\.00$/, "");
-  return manga.ratingVotes ? `${rating}/10 (${manga.ratingVotes} votes)` : `${rating}/10`;
+  return manga.ratingVotes ? `${rating}/10 (${new Intl.NumberFormat().format(manga.ratingVotes)})` : `${rating}/10`;
 }
 
 function displayMetadataDate(value?: string) {
@@ -486,12 +490,408 @@ function displayMetadataDate(value?: string) {
   }).format(date);
 }
 
+function displayDateTime(value?: string) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function displayDuration(ms?: number) {
+  if (!ms || ms <= 0) return undefined;
+  const minutes = Math.round(ms / (1000 * 60));
+  if (minutes < 1) return `${Math.round(ms / 1000)}s`;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function titleCaseLabel(value: string) {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+const BOOKMARK_JOB_ORDER = [
+  "title_detail",
+  "chapter_list",
+  "latest_check",
+  "latest_chapters",
+  "chapter_pages",
+  "title_comments",
+  "chapter_comments"
+] as const;
+const BOOKMARK_JOB_STATUS_ORDER = ["pending", "running", "done", "failed"] as const;
+
+const BOOKMARK_JOB_LABELS: Record<string, string> = {
+  title_detail: "Title Detail",
+  chapter_list: "Chapter List",
+  latest_check: "Latest Check",
+  latest_chapters: "Latest Chapter List",
+  chapter_pages: "Chapter Pages",
+  title_comments: "Title Comments",
+  chapter_comments: "Chapter Comments"
+};
+
+const BOOKMARK_JOB_DESCRIPTIONS: Record<string, string> = {
+  title_detail: "Saves title metadata for bookmarked titles.",
+  chapter_list: "Saves the full chapter index used by title pages, reader menus, and next/previous navigation.",
+  latest_check: "Checks bookmarked titles to see whether the source has a newer latest chapter.",
+  latest_chapters: "Saves only the newest chapter-list entries after a latest check finds updates.",
+  chapter_pages: "Saves the page/image URLs for each chapter so reader pages can load from DB storage.",
+  title_comments: "Saves read-only Comix title comment threads for bookmarked titles.",
+  chapter_comments: "Saves read-only Comix chapter comment threads by chapter number and volume."
+};
+
+function bookmarkJobLabel(jobType: string) {
+  return BOOKMARK_JOB_LABELS[jobType] ?? titleCaseLabel(jobType);
+}
+
+function bookmarkJobDescription(jobType: string) {
+  return BOOKMARK_JOB_DESCRIPTIONS[jobType] ?? "Queued bookmark worker job.";
+}
+
+function bookmarkJobOrder(jobType: string) {
+  const index = BOOKMARK_JOB_ORDER.findIndex((item) => item === jobType);
+  return index === -1 ? BOOKMARK_JOB_ORDER.length : index;
+}
+
+function pairKey(leftId: string, rightId: string) {
+  return [leftId, rightId].sort().join(":");
+}
+
+function displayRelativeTime(value?: string) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  const diff = date.getTime() - Date.now();
+  const abs = Math.abs(diff);
+  const units: Array<[Intl.RelativeTimeFormatUnit, number]> = [
+    ["day", 1000 * 60 * 60 * 24],
+    ["hour", 1000 * 60 * 60],
+    ["minute", 1000 * 60],
+    ["second", 1000]
+  ];
+  const [unit, size] = units.find(([, unitMs]) => abs >= unitMs) ?? ["second", 1000];
+  return new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(Math.round(diff / size), unit);
+}
+
+function DashboardTimeValue({ value, fallback }: { value?: string; fallback?: string }) {
+  const absolute = displayDateTime(value);
+  const relative = displayRelativeTime(value);
+  if (!absolute) return <strong>{fallback ?? "None"}</strong>;
+  return (
+    <strong className="dashboard-time-value">
+      <span>{absolute}</span>
+      {relative && <small>{relative}</small>}
+    </strong>
+  );
+}
+
+function commentPlainText(value: string) {
+  const fallback = value.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, " ");
+  if (typeof document === "undefined") return fallback.replace(/\s+/g, " ").trim();
+  const template = document.createElement("template");
+  template.innerHTML = value;
+  return (template.content.textContent ?? fallback).replace(/\s+/g, " ").trim();
+}
+
+function InlineExpandableText({
+  text,
+  expanded,
+  onToggle,
+  limit,
+  className
+}: {
+  text: string;
+  expanded: boolean;
+  onToggle: () => void;
+  limit: number;
+  className: string;
+}) {
+  const cleanText = text.trim();
+  const needsToggle = cleanText.length > limit;
+  const visibleText = !expanded && needsToggle ? cleanText.slice(0, limit).trimEnd() : cleanText;
+  return (
+    <p className={expanded ? `${className} expanded` : className}>
+      {visibleText || "No information available."}
+      {needsToggle && (
+        <span className="inline-toggle-wrap">
+          {!expanded && "…"}
+          <button className="inline-text-toggle" type="button" onClick={onToggle}>
+            {expanded ? "less" : "more"}
+          </button>
+        </span>
+      )}
+    </p>
+  );
+}
+
+function commentAuthorName(comment: CommentItem) {
+  return comment.user?.name?.trim() || "Comix user";
+}
+
+function commentMetaLabel(comment: CommentItem) {
+  const date = comment.createdAtFormatted || displayDateTime(comment.createdAt);
+  const flags = [comment.isPinned ? "Pinned" : "", comment.isEdited ? "Edited" : ""].filter(Boolean);
+  return [date, ...flags].filter(Boolean).join(" · ");
+}
+
+function commentReplyPreviewLimit(depth: number) {
+  return depth === 0 ? 3 : 2;
+}
+
+function countLoadedCommentReplies(comment: CommentItem): number {
+  const replies = comment.replies ?? [];
+  return replies.reduce((total, reply) => total + 1 + countLoadedCommentReplies(reply), 0);
+}
+
+function CommentCard({
+  comment,
+  depth = 0,
+  expanded = false
+}: {
+  comment: CommentItem;
+  depth?: number;
+  expanded?: boolean;
+}) {
+  const text = useMemo(() => commentPlainText(comment.contentHtml), [comment.contentHtml]);
+  const allReplies = Array.isArray(comment.replies) ? comment.replies : [];
+  const replies = expanded ? allReplies : allReplies.slice(0, commentReplyPreviewLimit(depth));
+  const loadedReplyCount = countLoadedCommentReplies(comment);
+  const avatarUrl = comment.user?.avatarUrl ? proxiedImageUrl(comment.user.avatarUrl) : undefined;
+  const articleRef = useRef<HTMLElement | null>(null);
+  const repliesRef = useRef<HTMLDivElement | null>(null);
+  const [lineHeight, setLineHeight] = useState<number | undefined>();
+
+  useLayoutEffect(() => {
+    if (!replies.length) {
+      setLineHeight(undefined);
+      return undefined;
+    }
+
+    const article = articleRef.current;
+    const repliesElement = repliesRef.current;
+    if (!article || !repliesElement) return undefined;
+
+    let frame = 0;
+    const measure = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const lastReply = repliesElement.lastElementChild;
+        if (!(lastReply instanceof HTMLElement)) return;
+        const articleRect = article.getBoundingClientRect();
+        const lastReplyRect = lastReply.getBoundingClientRect();
+        const articleStyles = window.getComputedStyle(article);
+        const replyStyles = window.getComputedStyle(lastReply);
+        const lineTop = Number.parseFloat(articleStyles.getPropertyValue("--comment-line-top")) || 0;
+        const elbowStop = Number.parseFloat(replyStyles.getPropertyValue("--reply-elbow-stop")) || 27;
+        const elbowTrim = Number.parseFloat(replyStyles.getPropertyValue("--reply-elbow-trim")) || 3;
+        const nextHeight = Math.max(0, lastReplyRect.top - articleRect.top + elbowStop - elbowTrim - lineTop);
+        setLineHeight((current) => (Math.abs((current ?? -1) - nextHeight) > 0.5 ? nextHeight : current));
+      });
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(article);
+    observer.observe(repliesElement);
+    window.addEventListener("resize", measure);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [replies.length, expanded, text]);
+
+  return (
+    <article
+      ref={articleRef}
+      className={depth > 0 ? "comment-card comment-card-reply" : "comment-card"}
+      style={lineHeight !== undefined ? ({ "--comment-line-height": `${lineHeight}px` } as CSSProperties) : undefined}
+    >
+      <div className="comment-header">
+        {avatarUrl ? (
+          <img src={avatarUrl} alt="" loading="lazy" decoding="async" />
+        ) : (
+          <span className="comment-avatar-fallback" aria-hidden="true">
+            {commentAuthorName(comment).slice(0, 1).toUpperCase()}
+          </span>
+        )}
+        <div>
+          <strong>{commentAuthorName(comment)}</strong>
+          {commentMetaLabel(comment) && <span>{commentMetaLabel(comment)}</span>}
+        </div>
+      </div>
+      <p>{text || "No comment text."}</p>
+      <div className="comment-stats" aria-label="Comment stats">
+        <span>{comment.likeCount ?? 0} likes</span>
+        {(comment.dislikeCount ?? 0) > 0 && <span>{comment.dislikeCount} dislikes</span>}
+        {loadedReplyCount > 0 && <span>{loadedReplyCount} {loadedReplyCount === 1 ? "reply" : "replies"}</span>}
+      </div>
+      {replies.length > 0 && (
+        <div className="comment-replies" ref={repliesRef}>
+          {replies.map((reply) => (
+            <CommentCard key={reply.id} comment={reply} depth={depth + 1} expanded={expanded} />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function commentDisplayStats(comments: CommentItem[], expanded = true, depth = 0) {
+  let replies = 0;
+  for (const comment of comments) {
+    const allNested = comment.replies ?? [];
+    const nested = expanded ? allNested : allNested.slice(0, commentReplyPreviewLimit(depth));
+    replies += nested.length;
+    replies += commentDisplayStats(nested, expanded, depth + 1).replies;
+  }
+  return { comments: comments.length, replies };
+}
+
+function hasLoadedCommentsOutsidePreview(comments: CommentItem[], rootLimit: number, depth = 0) {
+  if (depth === 0 && comments.length > rootLimit) return true;
+  const visibleComments = depth === 0 ? comments.slice(0, rootLimit) : comments;
+  for (const comment of visibleComments) {
+    const replies = comment.replies ?? [];
+    const replyLimit = commentReplyPreviewLimit(depth);
+    if (replies.length > replyLimit) return true;
+    if (hasLoadedCommentsOutsidePreview(replies.slice(0, replyLimit), rootLimit, depth + 1)) return true;
+  }
+  return false;
+}
+
+function commentCountText(commentCount: number, replyCount = 0) {
+  const comments = `${commentCount} ${commentCount === 1 ? "comment" : "comments"}`;
+  if (!replyCount) return comments;
+  return `${comments}, ${replyCount} ${replyCount === 1 ? "reply" : "replies"}`;
+}
+
+function threadCountText(comments: CommentPage | null) {
+  const total = comments?.thread.commentCount;
+  const main = comments?.thread.mainCommentCount;
+  if (typeof total === "number" && typeof main === "number" && main > 0 && total >= main) {
+    return commentCountText(main, total - main);
+  }
+  if (typeof total === "number" && total > 0) return commentCountText(total);
+  return undefined;
+}
+
+function CommentsPanel({
+  title,
+  comments,
+  loading,
+  error,
+  emptyLabel,
+  loadingMore = false,
+  expanded = false,
+  previewLimit = 7,
+  onShowMore,
+  onShowLess,
+  className = ""
+}: {
+  title: string;
+  comments: CommentPage | null;
+  loading: boolean;
+  error: string;
+  emptyLabel: string;
+  loadingMore?: boolean;
+  expanded?: boolean;
+  previewLimit?: number;
+  onShowMore?: () => void;
+  onShowLess?: () => void;
+  className?: string;
+}) {
+  const loadedComments = comments?.comments ?? [];
+  const visibleComments = expanded ? loadedComments : loadedComments.slice(0, previewLimit);
+  const visibleStats = commentDisplayStats(visibleComments, expanded);
+  const visibleCount = visibleStats.comments + visibleStats.replies;
+  const countLabel = threadCountText(comments) ?? commentCountText(visibleStats.comments, visibleStats.replies);
+  const allCountLabel = threadCountText(comments);
+  const totalThreadCount = comments?.thread.commentCount;
+  const loadedStats = commentDisplayStats(loadedComments);
+  const loadedCount = loadedStats.comments + loadedStats.replies;
+  const hasReliableTotal = typeof totalThreadCount === "number" && totalThreadCount >= loadedCount;
+  const hasLoadedHiddenItems = hasLoadedCommentsOutsidePreview(loadedComments, previewLimit);
+  const hasMoreThanPreview = Boolean(
+    comments &&
+      (loadedComments.length > previewLimit ||
+        hasLoadedHiddenItems ||
+        (loadedComments.length >= previewLimit && hasReliableTotal && totalThreadCount > loadedCount) ||
+        (!hasReliableTotal && Boolean(comments.cursor)))
+  );
+  const canShowMore = Boolean(
+    onShowMore &&
+      comments &&
+      !expanded &&
+      hasMoreThanPreview
+  );
+  const canShowLess = Boolean(onShowLess && expanded && hasMoreThanPreview);
+  return (
+    <section className={`comments-panel ${className}`.trim()}>
+      <div className="section-heading compact comments-heading">
+        <div>
+          <h2>{title}</h2>
+          <span>{visibleCount ? countLabel : "No comments loaded"}</span>
+        </div>
+      </div>
+      {loading && <LoadingNotice label="Loading comments" />}
+      {error && <div className="notice error">Comments could not be loaded: {error}</div>}
+      {!loading && !error && visibleComments.length === 0 && <div className="notice">{emptyLabel}</div>}
+      {!loading && !error && visibleComments.length > 0 && (
+        <div className="comments-list">
+          {visibleComments.map((comment) => (
+            <CommentCard key={comment.id} comment={comment} expanded={expanded} />
+          ))}
+        </div>
+      )}
+      {(canShowMore || canShowLess) && (
+        <button
+          className="comments-show-more-button"
+          type="button"
+          onClick={canShowLess ? onShowLess : onShowMore}
+          disabled={loadingMore}
+        >
+          {loadingMore ? "Loading comments..." : canShowLess ? "Show less" : `Show all ${allCountLabel ?? "comments"}`}
+        </button>
+      )}
+    </section>
+  );
+}
+
 function metadataSourceUrl(manga: MangaDetail) {
   const value = manga.links?.mu;
   if (!value) return undefined;
   if (/^https?:\/\//i.test(value)) return value;
   if (/^[a-z0-9]+$/i.test(value)) return `https://www.mangaupdates.com/series/${value}`;
   return undefined;
+}
+
+function metadataLinkUrl(kind: "mu" | "mal" | "al", value?: string) {
+  if (!value) return undefined;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (kind === "mu" && /^[a-z0-9]+$/i.test(value)) return `https://www.mangaupdates.com/series/${value}`;
+  if (kind === "mal" && /^\d+$/.test(value)) return `https://myanimelist.net/manga/${value}`;
+  if (kind === "al" && /^\d+$/.test(value)) return `https://anilist.co/manga/${value}`;
+  return undefined;
+}
+
+function metadataSourceLinks(manga: MangaDetail) {
+  const label = manga.metadataSource || "";
+  const links = [
+    { label: "MangaUpdates", href: metadataLinkUrl("mu", manga.links?.mu), active: /mangaupdates/i.test(label) || Boolean(manga.links?.mu) },
+    { label: "MyAnimeList", href: metadataLinkUrl("mal", manga.links?.mal), active: /myanimelist/i.test(label) || Boolean(manga.links?.mal) },
+    { label: "AniList", href: metadataLinkUrl("al", manga.links?.al), active: /anilist/i.test(label) || Boolean(manga.links?.al) }
+  ].filter((item) => item.active);
+  return links.length ? links : undefined;
 }
 
 function shortChapterLabel(chapter?: ChapterSummary) {
@@ -580,7 +980,24 @@ function parseCsv(text: string) {
   return rows;
 }
 
-function parseComickImport(text: string): ComickImportResult {
+type ImportSource = "comick" | "comix";
+
+interface ImportResult {
+  favorites: MangaSummary[];
+  progress: Array<{ source: string; mangaId: string; chapterId: string; chapterNumber?: string }>;
+  unresolved: number;
+  targetSource: string;
+}
+
+function normalizeImportedChapter(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const number = Number(trimmed);
+  if (Number.isFinite(number)) return Number.isInteger(number) ? String(number) : String(number).replace(/0+$/, "").replace(/\.$/, "");
+  return trimmed;
+}
+
+function parseComickImport(text: string): ImportResult {
   const [headers = [], ...rows] = parseCsv(text);
   if (!headers.includes("hid") || !headers.includes("title")) {
     throw new Error("This does not look like a Comick mylist CSV.");
@@ -594,7 +1011,7 @@ function parseComickImport(text: string): ComickImportResult {
   }
 
   const favorites: MangaSummary[] = [];
-  const progress: ComickImportResult["progress"] = [];
+  const progress: ImportResult["progress"] = [];
   const seen = new Set<string>();
 
   for (const row of rows) {
@@ -615,28 +1032,81 @@ function parseComickImport(text: string): ComickImportResult {
       tags: [type, origination].filter(Boolean)
     });
 
-    if (read) {
+    const chapter = normalizeImportedChapter(read);
+    if (chapter && chapter !== "0") {
       progress.push({
         source: "external",
         mangaId: hid,
-        chapterId: read,
-        chapterNumber: read
+        chapterId: chapter,
+        chapterNumber: chapter
       });
     }
   }
 
-  return { favorites, progress, unresolved: favorites.length };
+  return { favorites, progress, unresolved: favorites.length, targetSource: "comix" };
 }
 
-async function resolveImportedFavorites(imported: ComickImportResult): Promise<ComickImportResult> {
+function parseComixImport(text: string): ImportResult {
+  const [headers = [], ...rows] = parseCsv(text);
+  const normalizedHeaders = headers.map((header) => header.trim().toLowerCase());
+  if (!normalizedHeaders.includes("title") || !normalizedHeaders.includes("chapter")) {
+    throw new Error("This does not look like a Comix reading list CSV.");
+  }
+
+  const headerIndex = new Map(normalizedHeaders.map((header, index) => [header, index]));
+
+  function value(row: string[], key: string) {
+    const index = headerIndex.get(key);
+    return index === undefined ? "" : (row[index] || "").trim();
+  }
+
   const favorites: MangaSummary[] = [];
-  const progress: ComickImportResult["progress"] = [];
+  const progress: ImportResult["progress"] = [];
+  const seen = new Set<string>();
+
+  for (const row of rows) {
+    const title = value(row, "title");
+    if (!title) continue;
+    const externalId = value(row, "url_mu") || value(row, "url_al") || value(row, "url_mal") || title;
+    const key = externalId.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    favorites.push({
+      source: "external",
+      id: externalId,
+      title,
+      description: [value(row, "url_mal"), value(row, "url_al"), value(row, "url_mu")].filter(Boolean).join("\n") || undefined,
+      tags: []
+    });
+
+    const chapter = normalizeImportedChapter(value(row, "chapter"));
+    if (chapter && chapter !== "0") {
+      progress.push({
+        source: "external",
+        mangaId: externalId,
+        chapterId: chapter,
+        chapterNumber: chapter
+      });
+    }
+  }
+
+  return { favorites, progress, unresolved: favorites.length, targetSource: "comix" };
+}
+
+function parseImportFile(text: string, importSource: ImportSource) {
+  return importSource === "comix" ? parseComixImport(text) : parseComickImport(text);
+}
+
+async function resolveImportedFavorites(imported: ImportResult): Promise<ImportResult> {
+  const favorites: MangaSummary[] = [];
+  const progress: ImportResult["progress"] = [];
   let unresolved = 0;
 
   for (const favorite of imported.favorites) {
     const readProgress = imported.progress.find((item) => item.mangaId === favorite.id);
     try {
-      const { manga } = await searchManga("comix", favorite.title, "en", 0, 5);
+      const { manga } = await searchManga(imported.targetSource, favorite.title, "en", 0, 5);
       const normalizedTitle = favorite.title.trim().toLowerCase();
       const match =
         manga.find((item) => item.title.trim().toLowerCase() === normalizedTitle) ??
@@ -664,7 +1134,7 @@ async function resolveImportedFavorites(imported: ComickImportResult): Promise<C
     if (readProgress) progress.push(readProgress);
   }
 
-  return { favorites, progress, unresolved };
+  return { favorites, progress, unresolved, targetSource: imported.targetSource };
 }
 
 function Cover({ manga }: { manga: MangaSummary }) {
@@ -967,6 +1437,17 @@ function displayedChapterCount(chapters: ChapterSummary[]) {
   return highestChapter || groupChaptersByNumber(chapters).length;
 }
 
+function chapterGroupMatchesSearch(group: ChapterGroup, rawQuery: string) {
+  const query = rawQuery.trim().toLowerCase().replace(/^ch(?:apter)?\.?\s*/, "");
+  if (!query) return true;
+  return group.chapters.some((chapter) => {
+    const candidates = [group.label, chapter.chapter, compactChapterLabel(chapter.chapter), shortChapterLabel(chapter)]
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase());
+    return candidates.some((candidate) => candidate.includes(query));
+  });
+}
+
 function chapterListLooksPartial(chapters: ChapterSummary[]) {
   if (!chapters.length) return false;
   return displayedChapterCount(chapters) > groupChaptersByNumber(chapters).length;
@@ -1038,6 +1519,18 @@ function restoreScrollPosition(target: number, allowClamp = false) {
   const nextTop = Math.min(target, maxScroll);
   window.scrollTo({ top: nextTop });
   return Math.abs(currentScrollPosition() - nextTop) < 80;
+}
+
+function elementScrollProgressPercent(element: HTMLElement | null) {
+  if (!element) return readingProgressPercent();
+  const scrollTop = currentScrollPosition();
+  const rect = element.getBoundingClientRect();
+  const elementTop = scrollTop + rect.top;
+  const elementBottom = elementTop + element.offsetHeight;
+  const endScroll = Math.max(elementTop, elementBottom - window.innerHeight);
+  const scrollableDistance = endScroll - elementTop;
+  if (scrollableDistance <= 0) return scrollTop >= elementTop ? 100 : 0;
+  return Math.min(100, Math.max(0, ((scrollTop - elementTop) / scrollableDistance) * 100));
 }
 
 function isLikelyInternalChapterId(value?: string) {
@@ -1194,6 +1687,10 @@ function sortBookmarks(bookmarks: FavoriteManga[], sort: BookmarkSort) {
 
 function joinValues(values?: string[]) {
   return values?.filter(Boolean).join(", ");
+}
+
+function detailValues(values?: string[]) {
+  return uniqueText(values ?? []).filter(Boolean);
 }
 
 function MangaCard({
@@ -2280,6 +2777,7 @@ function AccountView({
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
+  const [importSource, setImportSource] = useState<ImportSource>("comick");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [importMessage, setImportMessage] = useState("");
@@ -2321,7 +2819,7 @@ function AccountView({
     setImporting(true);
     importFile
       .text()
-      .then(parseComickImport)
+      .then((text) => parseImportFile(text, importSource))
       .then(resolveImportedFavorites)
       .then(({ favorites, progress }) => importFavorites(favorites, progress))
       .then(({ favorites, imported }) => {
@@ -2397,6 +2895,13 @@ function AccountView({
             <h2>Import bookmarks</h2>
             {importMessage && <div className="notice success">{importMessage}</div>}
             {importError && <div className="notice error">{importError}</div>}
+            <label className="form-field">
+              <span>Import source</span>
+              <select value={importSource} onChange={(event) => setImportSource(event.target.value as ImportSource)}>
+                <option value="comick">Comick CSV</option>
+                <option value="comix">Comix CSV</option>
+              </select>
+            </label>
             <label className="form-field">
               <span>CSV file</span>
               <input
@@ -2485,6 +2990,9 @@ function AdminDashboardView() {
     ...(dashboard?.sourceBreakdown ?? []).map((item) => item.titleDetails + item.chapterLists + item.chapterPageRows)
   );
   const maxJobTypeValue = Math.max(1, ...(dashboard?.jobTypes ?? []).map((item) => item.total));
+  const userBookmarkRows = dashboard?.userBookmarks ?? [];
+  const userActivityRows = dashboard?.userActivity ?? [];
+  const maxUserBookmarks = Math.max(1, ...userBookmarkRows.map((item) => item.bookmarks));
   const memoryCacheRows = memoryCache
     ? [
         { label: "Entries", value: memoryCache.entries },
@@ -2494,6 +3002,10 @@ function AdminDashboardView() {
       ]
     : [];
   const memoryCacheTitle = memoryCacheRows.map((item) => `${item.label}: ${formatCount(item.value)}`).join("\n");
+  const refreshSchedules = dashboard?.refreshSchedules ?? [];
+  const orderedJobTypes = dashboard
+    ? [...dashboard.jobTypes].sort((left, right) => bookmarkJobOrder(left.jobType) - bookmarkJobOrder(right.jobType))
+    : [];
 
   return (
     <section className="admin-dashboard">
@@ -2522,6 +3034,89 @@ function AdminDashboardView() {
           </section>
 
           <section className="dashboard-grid">
+            {refreshSchedules.length > 0 && (
+              <article className="settings-panel dashboard-chart-panel dashboard-wide-panel">
+                <h3>Refresh schedule</h3>
+                <div className="refresh-schedule-list">
+                  {refreshSchedules.map((item) => {
+                    const interval = displayDuration(item.intervalMs);
+                    return (
+                      <div className="refresh-schedule-row" key={item.key} title={item.detail}>
+                        <div>
+                          <strong>{item.label}</strong>
+                          {item.detail && <span>{item.detail}</span>}
+                        </div>
+                        <span className={`refresh-status refresh-status-${item.status.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>
+                          {item.status}
+                        </span>
+                        <div>
+                          <span>Last</span>
+                          <DashboardTimeValue value={item.lastRefreshedAt} />
+                        </div>
+                        <div>
+                          <span>{item.status === "On demand" ? "Stale after" : "Next"}</span>
+                          <DashboardTimeValue value={item.nextRefreshAt} fallback={interval ? `Every ${interval}` : "None"} />
+                        </div>
+                        <div>
+                          <span>Interval</span>
+                          <strong>{interval ?? "None"}</strong>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </article>
+            )}
+
+            <article className="settings-panel dashboard-chart-panel dashboard-wide-panel">
+              <h3>User bookmarks</h3>
+              <div className="user-bookmark-chart">
+                {userBookmarkRows.map((item) => (
+                  <div className="user-bookmark-row" key={item.userId}>
+                    <div>
+                      <strong>{item.username}</strong>
+                      <span>{formatCount(item.bookmarks)} bookmarks</span>
+                    </div>
+                    <span
+                      className="dashboard-bar-track"
+                      title={`${item.username}: ${formatCount(item.bookmarks)} bookmarks`}
+                      aria-label={`${item.username}: ${formatCount(item.bookmarks)} bookmarks`}
+                    >
+                      <span style={{ width: `${Math.max(item.bookmarks ? 4 : 0, (item.bookmarks / maxUserBookmarks) * 100)}%` }} />
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {!userBookmarkRows.length && <div className="notice">No bookmark rows yet.</div>}
+            </article>
+
+            <article className="settings-panel dashboard-chart-panel dashboard-wide-panel">
+              <h3>User reading activity</h3>
+              <div className="dashboard-table-wrap">
+                <table className="dashboard-table">
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      <th>Last active</th>
+                      <th>Last read title</th>
+                      <th>Chapter</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {userActivityRows.map((item) => (
+                      <tr key={item.userId}>
+                        <td>{item.username}</td>
+                        <td><DashboardTimeValue value={item.lastActiveAt} /></td>
+                        <td>{item.lastReadTitle ?? "Not started"}</td>
+                        <td>{item.lastReadChapter ? `Ch. ${item.lastReadChapter}` : "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {!userActivityRows.length && <div className="notice">No user activity rows yet.</div>}
+            </article>
+
             <article className="settings-panel dashboard-chart-panel">
               <h3>DB storage coverage</h3>
               <div className="dashboard-bars">
@@ -2595,9 +3190,12 @@ function AdminDashboardView() {
                         <span className="source-bar-list" title={`Chapter lists: ${formatCount(item.chapterLists)}`} style={{ width: `${Math.max(3, (item.chapterLists / maxSourceValue) * 100)}%` }} />
                         <span className="source-bar-pages" title={`Chapters with pages: ${formatCount(item.chapterPageRows)}`} style={{ width: `${Math.max(3, (item.chapterPageRows / maxSourceValue) * 100)}%` }} />
                       </div>
-                      <span>
-                        {formatCount(item.titleDetails)} titles, {formatCount(item.chapterLists)} lists, {chapterWithPagesLabel(item.chapterPageRows)}, {formatCount(item.chapterPageImages)} images
-                      </span>
+                      <div className="source-metric-pills">
+                        <span className="source-metric-pill source-metric-title">{formatCount(item.titleDetails)} titles</span>
+                        <span className="source-metric-pill source-metric-list">{formatCount(item.chapterLists)} lists</span>
+                        <span className="source-metric-pill source-metric-pages">{chapterWithPagesLabel(item.chapterPageRows)}</span>
+                        <span className="source-metric-pill source-metric-images">{formatCount(item.chapterPageImages)} images</span>
+                      </div>
                     </div>
                   );
                 })}
@@ -2616,20 +3214,26 @@ function AdminDashboardView() {
               <div className="job-status-pills">
                 {dashboard.jobStatus.map((item) => (
                   <span key={item.status}>
-                    {item.status}: <strong>{formatCount(item.count)}</strong>
+                    {titleCaseLabel(item.status)}: <strong>{formatCount(item.count)}</strong>
                   </span>
                 ))}
               </div>
               <div className="job-type-chart">
-                {dashboard.jobTypes.map((item) => (
+                {orderedJobTypes.map((item) => {
+                  const jobLabel = bookmarkJobLabel(item.jobType);
+                  const jobDescription = bookmarkJobDescription(item.jobType);
+                  return (
                   <div className="job-type-row" key={item.jobType}>
-                    <strong>{item.jobType.replace(/_/g, " ")}</strong>
+                    <div className="job-type-label">
+                      <strong>{jobLabel}</strong>
+                      <span>{jobDescription}</span>
+                    </div>
                     <div
                       className="job-type-stack"
                       aria-label={`${item.jobType} jobs`}
-                      title={`${item.jobType.replace(/_/g, " ")}\nPending: ${formatCount(item.pending)}\nRunning: ${formatCount(item.running)}\nDone: ${formatCount(item.done)}\nFailed: ${formatCount(item.failed)}\nTotal: ${formatCount(item.total)}`}
+                      title={`${jobLabel}\n${jobDescription}\nPending: ${formatCount(item.pending)}\nRunning: ${formatCount(item.running)}\nDone: ${formatCount(item.done)}\nFailed: ${formatCount(item.failed)}\nTotal: ${formatCount(item.total)}`}
                     >
-                      {(["pending", "running", "done", "failed"] as const).map((status) => (
+                      {BOOKMARK_JOB_STATUS_ORDER.map((status) => (
                         <span
                           key={status}
                           className={`job-segment job-segment-${status}`}
@@ -2638,9 +3242,19 @@ function AdminDashboardView() {
                         />
                       ))}
                     </div>
-                    <span>{formatCount(item.total)}</span>
+                    <div className="job-metric-pills">
+                      {BOOKMARK_JOB_STATUS_ORDER.map((status) => (
+                        <span key={status} className={`job-metric-pill job-metric-${status}`}>
+                          {titleCaseLabel(status)} <strong>{formatCount(item[status])}</strong>
+                        </span>
+                      ))}
+                      <span className="job-metric-pill job-metric-total">
+                        Total <strong>{formatCount(item.total)}</strong>
+                      </span>
+                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </article>
 
@@ -2694,6 +3308,7 @@ function AdminView({
   const [userPage, setUserPage] = useState(0);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [noticeScope, setNoticeScope] = useState<"" | "create" | "users" | "interaction">("");
 	  const [sourceError, setSourceError] = useState("");
   const [sourceHealth, setSourceHealth] = useState<SourceHealth[]>([]);
   const [healthLoading, setHealthLoading] = useState(false);
@@ -2704,9 +3319,30 @@ function AdminView({
   const visibleUsers = users.slice(userPage * ADMIN_USERS_PAGE_SIZE, (userPage + 1) * ADMIN_USERS_PAGE_SIZE);
   const userStart = users.length ? userPage * ADMIN_USERS_PAGE_SIZE + 1 : 0;
   const userEnd = Math.min((userPage + 1) * ADMIN_USERS_PAGE_SIZE, users.length);
+  const blockedPairKeys = useMemo(
+    () => new Set(interactionBlocks.map((block) => pairKey(block.userAId, block.userBId))),
+    [interactionBlocks]
+  );
+  const affectedUserCount = useMemo(
+    () => new Set(interactionBlocks.flatMap((block) => [block.userAId, block.userBId])).size,
+    [interactionBlocks]
+  );
+  const sortedInteractionBlocks = useMemo(
+    () => [...interactionBlocks].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()),
+    [interactionBlocks]
+  );
+  const blockUserAName = users.find((user) => user.id === blockUserAId)?.username;
+  const blockUserBName = users.find((user) => user.id === blockUserBId)?.username;
+  const blockPairAlreadyExists = Boolean(blockUserAId && blockUserBId && blockedPairKeys.has(pairKey(blockUserAId, blockUserBId)));
+  const blockUserBOptions = users.filter((user) => {
+    if (!blockUserAId) return true;
+    if (user.id === blockUserAId) return false;
+    return !blockedPairKeys.has(pairKey(blockUserAId, user.id));
+  });
 
   function loadUsers() {
     setLoading(true);
+    setNoticeScope("users");
     setError("");
     Promise.all([fetchUsers(), fetchInteractionBlocks()])
       .then(([userResult, blockResult]) => {
@@ -2749,6 +3385,7 @@ function AdminView({
 
   function submitCreate(event: FormEvent) {
     event.preventDefault();
+    setNoticeScope("create");
     setMessage("");
     setError("");
     createAccount(username, password, role)
@@ -2764,6 +3401,7 @@ function AdminView({
 
   function submitInteractionBlock(event: FormEvent) {
     event.preventDefault();
+    setNoticeScope("interaction");
     setMessage("");
     setError("");
     addInteractionBlock(blockUserAId, blockUserBId)
@@ -2778,6 +3416,7 @@ function AdminView({
   }
 
   function requestRemoveInteractionBlock(block: UserInteractionBlock) {
+    setNoticeScope("interaction");
     setMessage("");
     setError("");
     setConfirmDialog({
@@ -2798,6 +3437,7 @@ function AdminView({
   }
 
   function submitReset(user: AccountUser) {
+    setNoticeScope("users");
     setMessage("");
     setError("");
     resetUserPassword(user.id, resetPasswords[user.id] || "")
@@ -2810,6 +3450,7 @@ function AdminView({
   }
 
   function requestDelete(user: AccountUser) {
+    setNoticeScope("users");
     setMessage("");
     setError("");
     setConfirmDialog({
@@ -2830,6 +3471,7 @@ function AdminView({
   }
 
   function toggleUserNsfw(user: AccountUser, nsfwAllowed: boolean) {
+    setNoticeScope("users");
     setMessage("");
     setError("");
     updateUserNsfwAllowed(user.id, nsfwAllowed)
@@ -2901,8 +3543,8 @@ function AdminView({
       <section className="admin-layout">
         <form className="settings-panel admin-create-panel" onSubmit={submitCreate}>
           <h2>Create account</h2>
-          {message && <div className="notice success">{message}</div>}
-          {error && <div className="notice error">{error}</div>}
+          {noticeScope === "create" && message && <div className="notice success">{message}</div>}
+          {noticeScope === "create" && error && <div className="notice error">{error}</div>}
           <label className="form-field">
             <span>Username</span>
             <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" />
@@ -2945,6 +3587,8 @@ function AdminView({
               </div>
             )}
           </div>
+          {noticeScope === "users" && message && <div className="notice success">{message}</div>}
+          {noticeScope === "users" && error && <div className="notice error">{error}</div>}
           {loading && <LoadingNotice label="Loading users" />}
           <div className="admin-users-table-wrap">
             <table className="admin-users-table">
@@ -3053,44 +3697,85 @@ function AdminView({
         </section>
 
         <section className="settings-panel admin-interaction-panel">
-          <h2>User interaction</h2>
-          <p className="muted-text">Disabled pairs cannot see each other in Share, and recommendation requests are blocked both ways.</p>
+          <div className="settings-panel-heading">
+            <div>
+              <h2>User interaction</h2>
+              <p className="muted-text">Blocked pairs cannot see each other in Share or send recommendations to each other.</p>
+            </div>
+          </div>
+          {noticeScope === "interaction" && message && <div className="notice success">{message}</div>}
+          {noticeScope === "interaction" && error && <div className="notice error">{error}</div>}
+
+          <div className="interaction-summary">
+            <div>
+              <span>Blocked pairs</span>
+              <strong>{interactionBlocks.length}</strong>
+            </div>
+            <div>
+              <span>Affected users</span>
+              <strong>{affectedUserCount}</strong>
+            </div>
+          </div>
+
           <form className="interaction-block-form" onSubmit={submitInteractionBlock}>
-            <label className="form-field">
-              <span>User A</span>
-              <select value={blockUserAId} onChange={(event) => setBlockUserAId(event.target.value)}>
-                <option value="">Choose user</option>
-                {users.map((user) => (
-                  <option key={user.id} value={user.id}>{user.username}</option>
-                ))}
-              </select>
-            </label>
-            <label className="form-field">
-              <span>User B</span>
-              <select value={blockUserBId} onChange={(event) => setBlockUserBId(event.target.value)}>
-                <option value="">Choose user</option>
-                {users.map((user) => (
-                  <option key={user.id} value={user.id}>{user.username}</option>
-                ))}
-              </select>
-            </label>
-            <button className="primary-button" type="submit" disabled={!blockUserAId || !blockUserBId || blockUserAId === blockUserBId}>
-              Disable interaction
+            <div className="interaction-picker-grid">
+              <label className="form-field">
+                <span>First user</span>
+                <select
+                  value={blockUserAId}
+                  onChange={(event) => {
+                    setBlockUserAId(event.target.value);
+                    setBlockUserBId("");
+                  }}
+                >
+                  <option value="">Choose user</option>
+                  {users.map((user) => (
+                    <option key={user.id} value={user.id}>{user.username}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="form-field">
+                <span>Second user</span>
+                <select value={blockUserBId} onChange={(event) => setBlockUserBId(event.target.value)} disabled={!blockUserAId}>
+                  <option value="">{blockUserAId ? "Choose user" : "Choose first user"}</option>
+                  {blockUserBOptions.map((user) => (
+                    <option key={user.id} value={user.id}>{user.username}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="interaction-block-preview">
+              {blockUserAId && blockUserBId ? (
+                <span>{blockUserAName} and {blockUserBName} will be hidden from each other.</span>
+              ) : blockUserAId && blockUserBOptions.length === 0 ? (
+                <span>Every available pair for {blockUserAName} is already blocked.</span>
+              ) : (
+                <span>Select two users to block sharing and recommendations in both directions.</span>
+              )}
+            </div>
+            <button className="primary-button" type="submit" disabled={!blockUserAId || !blockUserBId || blockPairAlreadyExists}>
+              {blockPairAlreadyExists ? "Already blocked" : "Block pair"}
             </button>
           </form>
-          <div className="user-list interaction-block-list">
-            {interactionBlocks.map((block) => (
-              <article className="user-row" key={block.id}>
-                <div>
-                  <strong>{block.userAUsername} / {block.userBUsername}</strong>
+
+          <div className="interaction-block-list">
+            {sortedInteractionBlocks.map((block) => (
+              <article className="interaction-block-card" key={block.id}>
+                <div className="interaction-block-users">
+                  <span>{block.userAUsername}</span>
+                  <small>blocked with</small>
+                  <span>{block.userBUsername}</span>
+                </div>
+                <div className="interaction-block-meta">
                   <span>Added by {block.createdByUsername}</span>
+                  <span>{displayDateTime(block.createdAt) ?? "Unknown date"}</span>
                 </div>
                 <button className="small-button" type="button" onClick={() => requestRemoveInteractionBlock(block)}>
-                  Enable
+                  Enable pair
                 </button>
               </article>
             ))}
-            {!interactionBlocks.length && !loading && <div className="notice">No disabled user pairs.</div>}
+            {!interactionBlocks.length && !loading && <div className="notice">No blocked user pairs.</div>}
           </div>
         </section>
       </section>
@@ -3105,6 +3790,7 @@ function DetailView({
   id,
   favorites,
   readingProgress,
+  userRole,
   showNsfw,
   shareUsers,
   onFavorite,
@@ -3117,6 +3803,7 @@ function DetailView({
   id: string;
   favorites: FavoriteManga[];
   readingProgress: ReadingProgress[];
+  userRole?: UserRole;
   showNsfw: boolean;
   shareUsers: AccountUser[];
   onFavorite: (manga: MangaSummary) => void;
@@ -3138,6 +3825,8 @@ function DetailView({
   const [factsExpanded, setFactsExpanded] = useState(false);
   const [chapterPage, setChapterPage] = useState(0);
   const [chapterSort, setChapterSort] = useState<ChapterSortMode>("chapter-desc");
+  const [chapterSearchInput, setChapterSearchInput] = useState("");
+  const [chapterSearchTerm, setChapterSearchTerm] = useState("");
   const [similarTitles, setSimilarTitles] = useState<MangaSummary[]>([]);
   const [similarLoading, setSimilarLoading] = useState(false);
   const [similarError, setSimilarError] = useState("");
@@ -3148,6 +3837,14 @@ function DetailView({
   const [shareLoading, setShareLoading] = useState(false);
   const [nsfwShareUserId, setNsfwShareUserId] = useState("");
   const [cacheStatus, setCacheStatus] = useState<TitleCacheStatus | null>(null);
+  const [titleComments, setTitleComments] = useState<CommentPage | null>(null);
+  const [titleCommentsLoading, setTitleCommentsLoading] = useState(false);
+  const [titleCommentsLoadingMore, setTitleCommentsLoadingMore] = useState(false);
+  const [titleCommentsExpanded, setTitleCommentsExpanded] = useState(false);
+  const [titleCommentsError, setTitleCommentsError] = useState("");
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
+  const categoryTagsRef = useRef<HTMLDivElement | null>(null);
+  const [categoryTagsNeedToggle, setCategoryTagsNeedToggle] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -3163,6 +3860,86 @@ function DetailView({
       cancelled = true;
     };
   }, [source, id]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 720px)");
+    const updateViewport = () => setIsMobileViewport(media.matches);
+    updateViewport();
+    media.addEventListener("change", updateViewport);
+    return () => media.removeEventListener("change", updateViewport);
+  }, []);
+
+  useLayoutEffect(() => {
+    const element = categoryTagsRef.current;
+    if (!element) {
+      setCategoryTagsNeedToggle(false);
+      return undefined;
+    }
+    const tagElement = element;
+
+    function measureTags() {
+      const styles = window.getComputedStyle(tagElement);
+      const rowHeight = parseFloat(styles.getPropertyValue("--tag-row-height")) || 28;
+      const rowGap = parseFloat(styles.getPropertyValue("--tag-row-gap")) || 6;
+      const collapsedRows = parseFloat(styles.getPropertyValue("--tag-collapsed-rows")) || 2;
+      const collapsedHeight = rowHeight * collapsedRows + rowGap * Math.max(collapsedRows - 1, 0);
+      setCategoryTagsNeedToggle(tagElement.scrollHeight > collapsedHeight + 1);
+    }
+
+    measureTags();
+    const observer = new ResizeObserver(measureTags);
+    observer.observe(tagElement);
+    window.addEventListener("resize", measureTags);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measureTags);
+    };
+  }, [manga?.id, factsExpanded, tagsExpanded]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTitleComments(null);
+    setTitleCommentsError("");
+    setTitleCommentsLoadingMore(false);
+    setTitleCommentsExpanded(false);
+    if (source !== "comix") {
+      setTitleCommentsLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setTitleCommentsLoading(true);
+    fetchTitleComments(source, id, 7)
+      .then((comments) => {
+        if (!cancelled) setTitleComments(comments);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setTitleCommentsError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setTitleCommentsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, id]);
+
+  function showAllTitleComments() {
+    if (source !== "comix") return;
+    setTitleCommentsLoadingMore(true);
+    setTitleCommentsError("");
+    fetchTitleComments(source, id, 50, true)
+      .then((comments) => {
+        setTitleComments(comments);
+        setTitleCommentsExpanded(true);
+      })
+      .catch((err: Error) => setTitleCommentsError(err.message))
+      .finally(() => setTitleCommentsLoadingMore(false));
+  }
+
+  function showLessTitleComments() {
+    setTitleCommentsExpanded(false);
+  }
 
   useEffect(() => {
     if (loading || chaptersLoading || chapterRefreshPending) return;
@@ -3257,14 +4034,20 @@ function DetailView({
   }, [source, id, manga?.canonicalKey, favorites, readingProgress]);
 
   const chapterGroups = useMemo(() => sortChapterGroups(groupChaptersByNumber(chapters), chapterSort), [chapters, chapterSort]);
+  const searchedChapterGroups = useMemo(
+    () => (chapterSearchTerm.trim() ? chapterGroups.filter((group) => chapterGroupMatchesSearch(group, chapterSearchTerm)) : chapterGroups),
+    [chapterGroups, chapterSearchTerm]
+  );
   const previewChapterSummary = useMemo(() => chapterRangeSummary(chapters), [chapters]);
 
-	  useEffect(() => {
-	    setSynopsisExpanded(false);
+		  useEffect(() => {
+		    setSynopsisExpanded(false);
     setAltTitlesExpanded(false);
     setTagsExpanded(false);
     setFactsExpanded(false);
     setChapterPage(0);
+    setChapterSearchInput("");
+    setChapterSearchTerm("");
     setShareOpen(false);
     setShareUserId("");
     setShareMessage("");
@@ -3274,7 +4057,7 @@ function DetailView({
 
   useEffect(() => {
     setChapterPage(0);
-  }, [chapterSort]);
+  }, [chapterSort, chapterSearchTerm]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3317,9 +4100,9 @@ function DetailView({
   }, [source, id]);
 
   useEffect(() => {
-    const maxPage = Math.max(Math.ceil(chapterGroups.length / CHAPTER_PAGE_SIZE) - 1, 0);
+    const maxPage = Math.max(Math.ceil(searchedChapterGroups.length / CHAPTER_PAGE_SIZE) - 1, 0);
     setChapterPage((current) => Math.min(current, maxPage));
-  }, [chapterGroups.length]);
+  }, [searchedChapterGroups.length]);
 
   if (loading) {
     return <main className="content loading-content"><LoadingNotice label="Loading title" page /></main>;
@@ -3360,25 +4143,44 @@ function DetailView({
   const readScrollPosition = lastReadChapter ? bookmark?.lastReadScrollPosition ?? progress?.scrollPosition : undefined;
   const displayTitle = preferredTitleFromAlternates(manga);
   const otherNames = uniqueText([manga.title, ...manga.altTitles]).filter((title) => title !== displayTitle).slice(0, 8);
+  const otherNamesText = otherNames.join(", ");
   const genres = mangaGenres(manga);
   const categoryTags = mangaCategoryTags(manga);
+  const metadataLinks = metadataSourceLinks(manga);
   const metadataUrl = metadataSourceUrl(manga);
+  const latestChapterNumber = chapters.reduce<number | undefined>((latest, chapter) => {
+    const value = chapterNumberValue(chapter.chapter);
+    if (value === undefined) return latest;
+    return latest === undefined || value > latest ? value : latest;
+  }, undefined);
+  const chapterCountLabel =
+    latestChapterNumber !== undefined
+      ? `${compactChapterLabel(String(latestChapterNumber))} Chapters`
+      : chapterGroups.length
+        ? `${chapterGroups.length} Chapters`
+        : undefined;
+  const titleTypeLabel = displayType(manga.demographic);
+  const contentRatingLabel = manga.contentRating ? displayStatus(manga.contentRating) : undefined;
   const detailFacts = [
-    { label: "Artist", value: joinValues(manga.artists) },
-    { label: "Author", value: joinValues(manga.authors) },
-    { label: "Publisher", value: joinValues(manga.publishers) },
-    { label: "Type", value: displayType(manga.demographic) },
+    { label: "Artist", value: detailValues(manga.artists) },
+    { label: "Author", value: detailValues(manga.authors) },
+    { label: "Publisher", value: detailValues(manga.publishers) },
     { label: "Release Year", value: manga.year ? String(manga.year) : undefined },
-    { label: "Content Rating", value: displayStatus(manga.contentRating) },
-    { label: "Language", value: manga.language || "English" },
-    { label: "Metadata Source", value: manga.metadataSource, href: metadataUrl },
-    { label: "Metadata Updated", value: displayMetadataDate(manga.metadataUpdatedAt) }
-  ].filter((item) => Boolean(item.value));
-  const chapterPageCount = Math.max(Math.ceil(chapterGroups.length / CHAPTER_PAGE_SIZE), 1);
-  const visibleChapterGroups = chapterGroups.slice(chapterPage * CHAPTER_PAGE_SIZE, (chapterPage + 1) * CHAPTER_PAGE_SIZE);
+    { label: "Metadata Source", value: manga.metadataSource, href: metadataUrl, links: metadataLinks }
+  ].filter((item) => (Array.isArray(item.value) ? item.value.length > 0 : Boolean(item.value)));
+  const hasAdditionalDetails = detailFacts.length > 0 || genres.length > 0 || categoryTags.length > 0;
+  const chapterSearchActive = Boolean(chapterSearchTerm.trim());
+  const chapterListComplete = !chaptersLoading && !chaptersError && !chapterRefreshPending && !(source === "comix" && chapterListLooksPartial(chapters));
+  const displayedChapterGroups = chapterListComplete ? searchedChapterGroups : chapterGroups;
+  const chapterPageCount = Math.max(Math.ceil(displayedChapterGroups.length / CHAPTER_PAGE_SIZE), 1);
+  const visibleChapterGroups = displayedChapterGroups.slice(chapterPage * CHAPTER_PAGE_SIZE, (chapterPage + 1) * CHAPTER_PAGE_SIZE);
   const chapterStart = chapterPage * CHAPTER_PAGE_SIZE + 1;
-  const chapterEnd = Math.min((chapterPage + 1) * CHAPTER_PAGE_SIZE, chapterGroups.length);
+  const chapterEnd = Math.min((chapterPage + 1) * CHAPTER_PAGE_SIZE, displayedChapterGroups.length);
   const showChapterPagination = chapterPageCount > 1;
+  const chapterPageNumbers = Array.from({ length: Math.min(5, chapterPageCount) }, (_, index) => {
+    const start = Math.min(Math.max(chapterPage - 2, 0), Math.max(chapterPageCount - 5, 0));
+    return start + index;
+  });
   const titleBackdropUrl = proxiedImageUrl(manga.coverUrl);
   const titleBackdropStyle = titleBackdropUrl
     ? ({ "--title-backdrop": `url("${titleBackdropUrl.replace(/"/g, "%22")}")` } as CSSProperties)
@@ -3386,7 +4188,7 @@ function DetailView({
   const titleIsNsfw = isNsfw(manga);
   const eligibleShareUsers = titleIsNsfw ? shareUsers.filter((item) => item.nsfwAllowed) : shareUsers;
   const cacheBadges: Array<{ key: string; icon: typeof faDatabase; label: string; value?: string }> = [];
-  if (cacheStatus?.titleMetadata.cached) {
+  if (userRole === "admin" && cacheStatus?.titleMetadata.cached) {
     cacheBadges.push({
       key: "metadata",
       icon: faDatabase,
@@ -3394,7 +4196,7 @@ function DetailView({
       value: cacheStatus.titleMetadata.checkedAt ? `Updated ${displayMetadataDate(cacheStatus.titleMetadata.checkedAt)}` : undefined
     });
   }
-  if (cacheStatus?.chapterList.cached) {
+  if (userRole === "admin" && cacheStatus?.chapterList.cached) {
     cacheBadges.push({
       key: "chapters",
       icon: faListUl,
@@ -3402,7 +4204,7 @@ function DetailView({
       value: `${cacheStatus.chapterList.chapters}`
     });
   }
-  if (cacheStatus?.chapterPages.cached) {
+  if (userRole === "admin" && cacheStatus?.chapterPages.cached) {
     cacheBadges.push({
       key: "pages",
       icon: faImages,
@@ -3411,24 +4213,44 @@ function DetailView({
     });
   }
 
-	  function ChapterPagination() {
+  function ChapterPagination() {
     if (!showChapterPagination) return null;
     return (
       <div className="pagination-controls chapter-pagination" aria-label="Chapter list pagination">
-        <button type="button" onClick={() => setChapterPage((current) => Math.max(current - 1, 0))} disabled={chapterPage === 0}>
-          Previous
-        </button>
-        <span>{chapterGroups.length ? `${chapterStart} - ${chapterEnd} of ${chapterGroups.length}` : "0 of 0"}</span>
-        <button
-          type="button"
-          onClick={() => setChapterPage((current) => Math.min(current + 1, chapterPageCount - 1))}
-          disabled={chapterPage >= chapterPageCount - 1}
-        >
-          Next
-        </button>
+        <span>{displayedChapterGroups.length ? `${chapterStart} - ${chapterEnd} of ${displayedChapterGroups.length}` : "0 of 0"}</span>
+        <div className="chapter-pagination-pages">
+          <button type="button" onClick={() => setChapterPage(0)} disabled={chapterPage === 0} aria-label="First page">
+            <FontAwesomeIcon icon={faAnglesLeft} aria-hidden="true" />
+          </button>
+          <button type="button" onClick={() => setChapterPage((current) => Math.max(current - 1, 0))} disabled={chapterPage === 0} aria-label="Previous page">
+            <FontAwesomeIcon icon={faChevronLeft} aria-hidden="true" />
+          </button>
+          {chapterPageNumbers.map((page) => (
+            <button
+              key={page}
+              className={page === chapterPage ? "active" : ""}
+              type="button"
+              onClick={() => setChapterPage(page)}
+              aria-current={page === chapterPage ? "page" : undefined}
+            >
+              {page + 1}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => setChapterPage((current) => Math.min(current + 1, chapterPageCount - 1))}
+            disabled={chapterPage >= chapterPageCount - 1}
+            aria-label="Next page"
+          >
+            <FontAwesomeIcon icon={faChevronRight} aria-hidden="true" />
+          </button>
+          <button type="button" onClick={() => setChapterPage(chapterPageCount - 1)} disabled={chapterPage >= chapterPageCount - 1} aria-label="Last page">
+            <FontAwesomeIcon icon={faAnglesRight} aria-hidden="true" />
+          </button>
+        </div>
       </div>
     );
-	  }
+		  }
 
 	  function submitShare(event: FormEvent) {
 	    event.preventDefault();
@@ -3529,21 +4351,52 @@ function DetailView({
       )}
       <section className="detail-layout">
         <aside className="title-cover-panel">
-          <Cover manga={manga} />
-          <div className="bookmark-cover-actions">
+          <div className="title-cover-frame">
+            <Cover manga={manga} />
             {favorite ? (
               <button
-                className="danger-bookmark-button"
+                className="cover-icon-button cover-bookmark-button active"
                 type="button"
                 onClick={() => onFavorite(manga)}
+                aria-label="Remove bookmark"
+                title="Remove bookmark"
               >
-                <TrashIcon />
-                <span>Remove bookmark</span>
+                <span className="bookmark-slash-icon" aria-hidden="true">
+                  <BookmarkIcon active={true} />
+                  <FontAwesomeIcon icon={faSlash} />
+                </span>
+              </button>
+            ) : (
+              <button className="cover-icon-button cover-bookmark-button" type="button" onClick={() => onFavorite(manga)} aria-label="Add bookmark" title="Add bookmark">
+                <BookmarkIcon active={false} />
+              </button>
+            )}
+            <button
+              className="cover-icon-button cover-share-button"
+              type="button"
+              onClick={() => {
+                setShareError("");
+                setShareOpen(true);
+              }}
+              aria-label="Share"
+              title="Share"
+            >
+              <ShareIcon />
+            </button>
+          </div>
+          <div className="desktop-cover-actions">
+            {favorite ? (
+              <button className="danger-bookmark-button" type="button" onClick={() => onFavorite(manga)}>
+                <span className="bookmark-slash-icon" aria-hidden="true">
+                  <BookmarkIcon active={true} />
+                  <FontAwesomeIcon icon={faSlash} />
+                </span>
+                Remove bookmark
               </button>
             ) : (
               <button className="bookmark-add-button" type="button" onClick={() => onFavorite(manga)}>
                 <BookmarkIcon active={false} />
-                <span>Add bookmark</span>
+                Add bookmark
               </button>
             )}
             <button
@@ -3555,100 +4408,141 @@ function DetailView({
               }}
             >
               <ShareIcon />
-              <span>Share</span>
+              Share
             </button>
           </div>
+          {readTarget && (
+            <button className="primary-button read-primary-button cover-read-button" onClick={() => onRead(readTarget, readScrollPosition)}>
+              {readLabel}
+            </button>
+          )}
           {shareMessage && <div className="notice success share-notice">{shareMessage}</div>}
         </aside>
 
-        <article className="title-info">
-          <h1>{displayTitle}</h1>
-          {cacheBadges.length > 0 && (
-            <div className="title-cache-badges" aria-label="Database storage status">
-              {cacheBadges.map((badge) => (
-                <span className="title-cache-badge" key={badge.key} title={badge.label} aria-label={badge.label}>
-                  <FontAwesomeIcon icon={badge.icon} aria-hidden="true" />
-                  <span>{badge.value ?? "Saved"}</span>
+        <div className="title-main-column">
+          <article className="title-info">
+            <h1>{displayTitle}</h1>
+            {otherNames.length > 0 && (
+              <p className={altTitlesExpanded ? "title-alt-names expanded" : "title-alt-names"}>
+                <span className="title-alt-names-full">{otherNamesText}</span>
+                <span className="title-alt-names-mobile">
+                  <span className="title-alt-names-mobile-text">{otherNamesText}</span>
+                  {otherNamesText.length > 64 && (
+                    <span className="inline-toggle-wrap">
+                      <button className="inline-text-toggle" type="button" onClick={() => setAltTitlesExpanded((expanded) => !expanded)}>
+                        {altTitlesExpanded ? "less" : "more"}
+                      </button>
+                    </span>
+                  )}
                 </span>
-              ))}
-            </div>
-          )}
-          <TitleRating manga={manga} />
-          {otherNames.length > 0 && (
-            <section className="title-detail-section known-names-block">
-              <h2>Alternate names</h2>
-              <p className={altTitlesExpanded ? "known-names expanded" : "known-names"}>{otherNames.join(", ")}</p>
-              <button className="text-toggle-button alt-title-toggle" type="button" onClick={() => setAltTitlesExpanded((expanded) => !expanded)}>
-                {altTitlesExpanded ? "Show less" : "Show more"}
-              </button>
+              </p>
+            )}
+            {cacheBadges.length > 0 && (
+              <div className="title-cache-badges" aria-label="Database storage status">
+                {cacheBadges.map((badge) => (
+                  <span className="title-cache-badge" key={badge.key} title={badge.label} aria-label={badge.label}>
+                    <FontAwesomeIcon icon={badge.icon} aria-hidden="true" />
+                    <span>{badge.value ?? "Saved"}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+            {(manga.status || titleTypeLabel || contentRatingLabel || chapterCountLabel) && (
+              <section className="title-detail-section status-section">
+                <div className="status-pill-row">
+                  {manga.status && <span className={statusClassName(manga.status)}>{displayStatus(manga.status)}</span>}
+                  {titleTypeLabel && <span className="status-pill status-type">{titleTypeLabel}</span>}
+                  {contentRatingLabel && <span className="status-pill status-content-rating">{contentRatingLabel}</span>}
+                  {chapterCountLabel && <span className="status-pill status-chapters">{chapterCountLabel}</span>}
+                </div>
+              </section>
+            )}
+            <TitleRating manga={manga} />
+            <section className="title-detail-section synopsis-section">
+              <h2>Synopsis</h2>
+              <InlineExpandableText
+                text={manga.description || "No synopsis available."}
+                expanded={synopsisExpanded}
+                onToggle={() => setSynopsisExpanded((expanded) => !expanded)}
+                limit={isMobileViewport ? 170 : 310}
+                className="synopsis"
+              />
             </section>
-          )}
-          {manga.status && (
-            <section className="title-detail-section status-section">
-              <h2>Status</h2>
-              <span className={statusClassName(manga.status)}>{displayStatus(manga.status)}</span>
-            </section>
-          )}
-          <section className="title-detail-section synopsis-section">
-            <h2>Synopsis</h2>
-            <p className={synopsisExpanded ? "synopsis expanded" : "synopsis"}>{manga.description || "No synopsis available."}</p>
-            <button className="text-toggle-button synopsis-toggle" type="button" onClick={() => setSynopsisExpanded((expanded) => !expanded)}>
-              {synopsisExpanded ? "Show less" : "Show more"}
+          </article>
+
+          {hasAdditionalDetails && (
+            <button className="mobile-toggle-button facts-toggle" type="button" onClick={() => setFactsExpanded((expanded) => !expanded)}>
+              <FontAwesomeIcon icon={factsExpanded ? faChevronUp : faChevronDown} aria-hidden="true" />
+              <span>{factsExpanded ? "Hide additional details" : "Show additional details"}</span>
             </button>
-          </section>
-          {genres.length > 0 && (
-            <section className="title-detail-section">
-              <h2>Genre</h2>
-              <div className="tag-row genre-tags">
-                {genres.map((tag) => (
-                  <button key={tag} type="button" onClick={() => onTagSearch(tag)}>{tag}</button>
-                ))}
-              </div>
-            </section>
           )}
-          {categoryTags.length > 0 && (
-            <section className="title-detail-section">
-              <h2>Categories</h2>
-              <div className={tagsExpanded ? "tag-row category-tags expanded" : "tag-row category-tags"}>
-                {categoryTags.map((tag) => (
-                  <button key={tag} type="button" onClick={() => onTagSearch(tag)}>{tag}</button>
-                ))}
-              </div>
-              <button className="text-toggle-button tags-toggle" type="button" onClick={() => setTagsExpanded((expanded) => !expanded)}>
-                {tagsExpanded ? "Show less" : "Show more"}
-              </button>
-            </section>
-          )}
-        </article>
 
-        {detailFacts.length > 0 && (
-          <button className="mobile-toggle-button facts-toggle" type="button" onClick={() => setFactsExpanded((expanded) => !expanded)}>
-            {factsExpanded ? "Hide details" : "Show details"}
-          </button>
-        )}
-
-        <aside className={factsExpanded ? "detail-facts expanded" : "detail-facts"} aria-label="Details">
-          <h2>Details</h2>
-          {detailFacts.map((fact) => (
-            <div className="fact-card" key={fact.label}>
-              <span>{fact.label}</span>
-              {fact.href ? (
-                <a className="fact-value" href={fact.href} target="_blank" rel="noreferrer">{fact.value}</a>
-              ) : (
-                <span className="fact-value">{fact.value}</span>
+          {hasAdditionalDetails && (
+            <aside className={factsExpanded ? "detail-facts expanded" : "detail-facts"} aria-label="Details">
+              {genres.length > 0 && (
+                <div className="fact-card fact-card-wide detail-tag-card">
+                  <span>Genre</span>
+                  <div className="tag-row genre-tags">
+                    {genres.map((tag) => (
+                      <button key={tag} type="button" onClick={() => onTagSearch(tag)}>{tag}</button>
+                    ))}
+                  </div>
+                </div>
               )}
-            </div>
-          ))}
-        </aside>
-
-	      <div className="title-actions">
-	        {readTarget && (
-	          <button className="primary-button read-primary-button" onClick={() => onRead(readTarget, readScrollPosition)}>
-	            {readLabel}
-	          </button>
+              {categoryTags.length > 0 && (
+                <div className="fact-card fact-card-wide detail-tag-card">
+                  <span>Categories</span>
+                  <div ref={categoryTagsRef} className={tagsExpanded ? "tag-row category-tags expanded" : "tag-row category-tags"}>
+                    {categoryTags.map((tag) => (
+                      <button key={tag} type="button" onClick={() => onTagSearch(tag)}>{tag}</button>
+                    ))}
+                  </div>
+                  {categoryTagsNeedToggle && (
+                    <button className="text-toggle-button tags-toggle" type="button" onClick={() => setTagsExpanded((expanded) => !expanded)}>
+                      {tagsExpanded ? "less" : "more"}
+                    </button>
+                  )}
+                </div>
+              )}
+              {detailFacts.map((fact) => (
+                <div className="fact-card" key={fact.label}>
+                  <span>{fact.label}</span>
+                  {fact.links?.length ? (
+                    <span className="fact-link-row">
+                      {fact.links.map((link) =>
+                        link.href ? (
+                          <a key={link.label} className="fact-source-link" href={link.href} target="_blank" rel="noreferrer">
+                            {link.label}
+                          </a>
+                        ) : (
+                          <span key={link.label} className="fact-source-link static">{link.label}</span>
+                        )
+                      )}
+                    </span>
+                  ) : Array.isArray(fact.value) ? (
+                    <span className="fact-value-row">
+                      {fact.value.map((value) => (
+                        <span className="fact-value" key={value}>{value}</span>
+                      ))}
+                    </span>
+                  ) : fact.href ? (
+                    <a className="fact-value" href={fact.href} target="_blank" rel="noreferrer">{fact.value}</a>
+                  ) : (
+                    <span className="fact-value">{fact.value}</span>
+                  )}
+                </div>
+              ))}
+            </aside>
           )}
-	      </div>
+        </div>
+
       </section>
+
+      {readTarget && (
+        <button className="primary-button read-primary-button mobile-floating-read-button" onClick={() => onRead(readTarget, readScrollPosition)}>
+          {readLabel}
+        </button>
+      )}
 
       <section className="chapter-list">
         <div className="section-heading compact chapter-list-heading">
@@ -3679,6 +4573,33 @@ function DetailView({
           </div>
         )}
         {!chaptersLoading && !chaptersError && <ChapterPagination />}
+        {chapterListComplete && chapterGroups.length > 0 && (
+          <div className="chapter-list-tools">
+            <div className="chapter-search-form">
+              <label>
+                <span>Chapter</span>
+                <input
+                  type="search"
+                  inputMode="decimal"
+                  value={chapterSearchInput}
+                  onChange={(event) => {
+                    setChapterSearchInput(event.target.value);
+                    setChapterSearchTerm(event.target.value.trim());
+                  }}
+                  placeholder="Number"
+                  aria-label="Chapter number"
+                />
+              </label>
+            </div>
+          </div>
+        )}
+        {chapterListComplete && chapterSearchActive && (
+          <div className="chapter-search-status">
+            {displayedChapterGroups.length
+              ? `Showing ${displayedChapterGroups.length} ${displayedChapterGroups.length === 1 ? "match" : "matches"} for Ch. ${chapterSearchTerm}`
+              : `No chapters found for Ch. ${chapterSearchTerm}`}
+          </div>
+        )}
 	        <div className="chapter-table">
 	          {!chaptersLoading && !chaptersError && visibleChapterGroups.map((group) => {
               const choices = dedupeChapterChoices(group.chapters, lastReadChapter?.id);
@@ -3733,8 +4654,24 @@ function DetailView({
           })}
         </div>
         {!chaptersLoading && !chaptersError && <ChapterPagination />}
-        {!chaptersLoading && !chaptersError && !chapterGroups.length && <div className="notice">No hosted image chapters are available for this title.</div>}
+        {!chaptersLoading && !chaptersError && !chapterSearchActive && !chapterGroups.length && <div className="notice">No hosted image chapters are available for this title.</div>}
+        {!chaptersLoading && !chaptersError && chapterSearchActive && !displayedChapterGroups.length && <div className="notice">No matching chapters are available.</div>}
       </section>
+
+      {source === "comix" && (
+        <CommentsPanel
+          title="Comments"
+          comments={titleComments}
+          loading={titleCommentsLoading}
+          error={titleCommentsError}
+          emptyLabel="No comments yet."
+          loadingMore={titleCommentsLoadingMore}
+          expanded={titleCommentsExpanded}
+          previewLimit={7}
+          onShowMore={showAllTitleComments}
+          onShowLess={showLessTitleComments}
+        />
+      )}
 
       {(similarLoading || similarTitles.length > 0 || similarError) && (
         <section className="similar-titles">
@@ -3822,6 +4759,7 @@ function ReaderView({
   const widthSliderActive = useRef(false);
   const widthSliderTrack = useRef<HTMLDivElement | null>(null);
   const failedAutoFallbackKey = useRef("");
+  const pagesElement = useRef<HTMLElement | null>(null);
   const restoreReady = useRef(false);
   const restoreCancelled = useRef(false);
   const skipUnmountSave = useRef(false);
@@ -3834,11 +4772,18 @@ function ReaderView({
   const [progressPosition, setProgressPosition] = useState<ReaderProgressPosition>("bottom");
   const [readerPageWidth, setReaderPageWidth] = useState(loadReaderPageWidth);
   const [topChapterControlsEnabled, setTopChapterControlsEnabled] = useState(loadReaderTopControls);
+  const [readerCommentsPanelOpen, setReaderCommentsPanelOpen] = useState(false);
+  const [readerCommentsRevealReady, setReaderCommentsRevealReady] = useState(false);
   const [pagedPageIndex, setPagedPageIndex] = useState(0);
   const [readerPercent, setReaderPercent] = useState(0);
   const [readerTipVisible, setReaderTipVisible] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [mobilePanelAnchor, setMobilePanelAnchor] = useState<"top" | "bottom">("bottom");
+  const [chapterComments, setChapterComments] = useState<CommentPage | null>(null);
+  const [chapterCommentsLoading, setChapterCommentsLoading] = useState(false);
+  const [chapterCommentsLoadingMore, setChapterCommentsLoadingMore] = useState(false);
+  const [chapterCommentsExpanded, setChapterCommentsExpanded] = useState(false);
+  const [chapterCommentsError, setChapterCommentsError] = useState("");
 
   useEffect(() => {
     chaptersRef.current = [];
@@ -4018,8 +4963,83 @@ function ReaderView({
   }, [pages?.pages, pagedPageIndex, pagedReader, readerDirection, readerPageMode]);
 
   useEffect(() => {
+    let cancelled = false;
+    const targetChapterNumber = currentChapter?.chapter ?? chapterNumber;
+    setChapterComments(null);
+    setChapterCommentsError("");
+    setChapterCommentsLoadingMore(false);
+    setChapterCommentsExpanded(false);
+    setChapterCommentsLoading(false);
+    if (!readerCommentsPanelOpen || !readerCommentsRevealReady || source !== "comix" || !targetChapterNumber || chapterComments) {
+      setChapterCommentsLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setChapterCommentsLoading(true);
+    fetchChapterComments(source, mangaId, targetChapterNumber, currentChapter?.volume ?? "0", 20)
+      .then((comments) => {
+        if (!cancelled) setChapterComments(comments);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setChapterCommentsError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setChapterCommentsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [readerCommentsPanelOpen, readerCommentsRevealReady, source, mangaId, chapterNumber, currentChapter?.chapter, currentChapter?.volume]);
+
+  useEffect(() => {
+    setReaderCommentsPanelOpen(false);
+    setReaderCommentsRevealReady(false);
+  }, [source, mangaId, chapterId]);
+
+  function showAllChapterComments() {
+    const targetChapterNumber = currentChapter?.chapter ?? chapterNumber;
+    if (source !== "comix" || !targetChapterNumber) return;
+    setChapterCommentsLoadingMore(true);
+    setChapterCommentsError("");
+    fetchChapterComments(source, mangaId, targetChapterNumber, currentChapter?.volume ?? "0", 50, true)
+      .then((comments) => {
+        setChapterComments(comments);
+        setChapterCommentsExpanded(true);
+      })
+      .catch((err: Error) => setChapterCommentsError(err.message))
+      .finally(() => setChapterCommentsLoadingMore(false));
+  }
+
+  function showLessChapterComments() {
+    setChapterCommentsExpanded(false);
+  }
+
+  useEffect(() => {
     if (readerDirection === "top-to-bottom") setReaderPageMode("single");
   }, [readerDirection]);
+
+  useEffect(() => {
+    if (!readerCommentsPanelOpen) {
+      setReaderCommentsRevealReady(false);
+      return;
+    }
+    setReaderCommentsRevealReady(false);
+    const timeout = window.setTimeout(() => setReaderCommentsRevealReady(true), 2000);
+    return () => window.clearTimeout(timeout);
+  }, [readerCommentsPanelOpen]);
+
+  useEffect(() => {
+    if (!readerCommentsPanelOpen) return undefined;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverscroll = document.documentElement.style.overscrollBehavior;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overscrollBehavior = "none";
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overscrollBehavior = previousHtmlOverscroll;
+    };
+  }, [readerCommentsPanelOpen]);
 
   useEffect(() => {
     try {
@@ -4071,7 +5091,7 @@ function ReaderView({
         setReaderPercent(Math.min(100, Math.max(0, (pagedPageIndex / maxIndex) * 100)));
         return;
       }
-      setReaderPercent(readingProgressPercent());
+      setReaderPercent(elementScrollProgressPercent(pagesElement.current));
     };
     const hideChrome = () => {
       update();
@@ -4453,6 +5473,186 @@ function ReaderView({
     setMobileControlsVisible(true);
   }
 
+  const chapterCommentStats = commentDisplayStats(chapterComments?.comments ?? []);
+  const chapterCommentCountLabel =
+    threadCountText(chapterComments) ?? commentCountText(chapterCommentStats.comments, chapterCommentStats.replies);
+  const commentsToggleLabel = readerCommentsPanelOpen ? "Close comments" : "Open comments";
+
+  function toggleReaderComments() {
+    setReaderCommentsPanelOpen((open) => !open);
+    setMobilePickerOpen(false);
+    setMobileSettingsOpen(false);
+    setMobileControlsVisible(true);
+  }
+
+  function closeReaderComments() {
+    setReaderCommentsPanelOpen(false);
+    setReaderCommentsRevealReady(false);
+  }
+
+  function ReaderCommentToggleButton({ compact = false }: { compact?: boolean }) {
+    return (
+      <button
+        className={compact ? "reader-mobile-icon-button reader-comment-icon-button" : "reader-comment-toggle"}
+        type="button"
+        onClick={toggleReaderComments}
+        aria-pressed={readerCommentsPanelOpen}
+        aria-label={commentsToggleLabel}
+        title={commentsToggleLabel}
+      >
+        <FontAwesomeIcon icon={faCommentDots} aria-hidden="true" />
+        {!compact && <span>{readerCommentsPanelOpen ? "Comments open" : "Comments"}</span>}
+      </button>
+    );
+  }
+
+  function ReaderCommentsSkeleton() {
+    return (
+      <div className="reader-comments-skeleton" aria-label="Preparing comments">
+        <article className="comment-card comment-card-skeleton has-skeleton-replies">
+          <span className="skeleton-thread-line" aria-hidden="true" />
+          <div className="comment-header">
+            <span className="comment-avatar-fallback reader-skeleton-pulse" aria-hidden="true" />
+            <div>
+              <strong className="reader-skeleton-pulse" />
+              <span className="reader-skeleton-pulse" />
+            </div>
+          </div>
+          <p>
+            <i className="reader-skeleton-pulse" />
+            <i className="reader-skeleton-pulse" />
+            <i className="reader-skeleton-pulse short" />
+          </p>
+          <div className="comment-stats">
+            <span className="reader-skeleton-pulse" />
+            <span className="reader-skeleton-pulse" />
+          </div>
+          <div className="comment-replies">
+            <article className="comment-card comment-card-reply comment-card-skeleton has-skeleton-replies">
+              <span className="skeleton-reply-elbow" aria-hidden="true" />
+              <span className="skeleton-thread-line" aria-hidden="true" />
+              <div className="comment-header">
+                <span className="comment-avatar-fallback reader-skeleton-pulse" aria-hidden="true" />
+                <div>
+                  <strong className="reader-skeleton-pulse" />
+                  <span className="reader-skeleton-pulse" />
+                </div>
+              </div>
+              <p>
+                <i className="reader-skeleton-pulse" />
+                <i className="reader-skeleton-pulse short" />
+              </p>
+              <div className="comment-stats">
+                <span className="reader-skeleton-pulse" />
+              </div>
+              <div className="comment-replies">
+                <article className="comment-card comment-card-reply comment-card-skeleton">
+                  <span className="skeleton-reply-elbow" aria-hidden="true" />
+                  <div className="comment-header">
+                    <span className="comment-avatar-fallback reader-skeleton-pulse" aria-hidden="true" />
+                    <div>
+                      <strong className="reader-skeleton-pulse" />
+                      <span className="reader-skeleton-pulse" />
+                    </div>
+                  </div>
+                  <p>
+                    <i className="reader-skeleton-pulse" />
+                    <i className="reader-skeleton-pulse short" />
+                  </p>
+                  <div className="comment-stats">
+                    <span className="reader-skeleton-pulse" />
+                  </div>
+                </article>
+              </div>
+            </article>
+            <article className="comment-card comment-card-reply comment-card-skeleton">
+              <span className="skeleton-reply-elbow" aria-hidden="true" />
+              <div className="comment-header">
+                <span className="comment-avatar-fallback reader-skeleton-pulse" aria-hidden="true" />
+                <div>
+                  <strong className="reader-skeleton-pulse" />
+                  <span className="reader-skeleton-pulse" />
+                </div>
+              </div>
+              <p>
+                <i className="reader-skeleton-pulse" />
+                <i className="reader-skeleton-pulse short" />
+              </p>
+              <div className="comment-stats">
+                <span className="reader-skeleton-pulse" />
+              </div>
+            </article>
+          </div>
+        </article>
+        <article className="comment-card comment-card-skeleton">
+          <div className="comment-header">
+            <span className="comment-avatar-fallback reader-skeleton-pulse" aria-hidden="true" />
+            <div>
+              <strong className="reader-skeleton-pulse" />
+              <span className="reader-skeleton-pulse" />
+            </div>
+          </div>
+          <p>
+            <i className="reader-skeleton-pulse" />
+            <i className="reader-skeleton-pulse short" />
+          </p>
+          <div className="comment-stats">
+            <span className="reader-skeleton-pulse" />
+          </div>
+        </article>
+      </div>
+    );
+  }
+
+  function ReaderCommentsDrawer() {
+    if (!readerCommentsPanelOpen || source !== "comix") return null;
+    const waitingToReveal = !readerCommentsRevealReady;
+    const showingSkeleton = waitingToReveal || (!chapterComments && !chapterCommentsError);
+    return (
+      <div className="reader-comments-drawer-backdrop" role="presentation" onClick={closeReaderComments}>
+        <aside
+          className="reader-comments-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-comments-title"
+          onClick={(event) => event.stopPropagation()}
+          onWheel={(event) => event.stopPropagation()}
+          onTouchMove={(event) => event.stopPropagation()}
+        >
+          <header className="reader-comments-drawer-header">
+            <div>
+              <h2 id="reader-comments-title">Comments</h2>
+              {showingSkeleton ? <span className="reader-comments-count-skeleton reader-skeleton-pulse" aria-hidden="true" /> : <span>{chapterCommentCountLabel}</span>}
+              <p>
+                These comments may contain <strong>spoilers</strong> for this chapter.
+              </p>
+            </div>
+            <button className="reader-comments-close" type="button" onClick={closeReaderComments} aria-label="Close comments">
+              <FontAwesomeIcon icon={faXmark} aria-hidden="true" />
+            </button>
+          </header>
+          {showingSkeleton ? (
+            <ReaderCommentsSkeleton />
+          ) : (
+            <CommentsPanel
+              title="Comments"
+              comments={chapterComments}
+              loading={chapterCommentsLoading}
+              error={chapterCommentsError}
+              emptyLabel="No comments yet."
+              loadingMore={chapterCommentsLoadingMore}
+              expanded={chapterCommentsExpanded}
+              previewLimit={20}
+              onShowMore={showAllChapterComments}
+              onShowLess={showLessChapterComments}
+              className="reader-comments reader-comments-drawer-panel"
+            />
+          )}
+        </aside>
+      </div>
+    );
+  }
+
   function toggleFullscreen() {
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => undefined);
@@ -4684,6 +5884,7 @@ function ReaderView({
             <FontAwesomeIcon icon={faChevronRight} aria-hidden="true" />
           </button>
           <div className="reader-mobile-tools" aria-label="Reader tools">
+            {source === "comix" && <ReaderCommentToggleButton compact />}
             <button className="reader-mobile-icon-button" type="button" onClick={showReaderTip} aria-label="Show reader controls guide">
               <FontAwesomeIcon icon={faQuestionCircle} aria-hidden="true" />
             </button>
@@ -4782,7 +5983,7 @@ function ReaderView({
           )}
         </div>
 
-        <div className="reader-nav-pair">
+        <div className={source === "comix" ? "reader-nav-pair with-comments" : "reader-nav-pair"}>
           <button className="reader-nav-button" type="button" onClick={() => void changeAdjacentChapter("previous")} disabled={chaptersRefreshing}>
             <ArrowLeftIcon />
             <span>{previousChapter ? `Previous ${shortChapterLabel(previousChapter)}` : "Previous: title"}</span>
@@ -4791,6 +5992,7 @@ function ReaderView({
             <span>{chaptersRefreshing ? "Loading chapters..." : nextChapter ? `Next ${shortChapterLabel(nextChapter)}` : "Next: title"}</span>
             <ArrowRightIcon />
           </button>
+          {source === "comix" && <ReaderCommentToggleButton />}
         </div>
 
       </nav>
@@ -4845,12 +6047,17 @@ function ReaderView({
           </section>
         </div>
       )}
-      {loading && <LoadingNotice label="Loading pages" />}
+      {loading && (
+        <div className="reader-loading-center">
+          <LoadingNotice label="Loading pages" />
+        </div>
+      )}
       {error && <div className="notice error">{error}</div>}
       {!loading && chaptersRefreshing && <LoadingNotice label="Loading more chapters" />}
       {chapterError && <div className="notice error">{chapterError}</div>}
       {!loading && <ReaderControls placement="top" />}
       <section
+        ref={pagesElement}
         className="pages"
         style={!pagedReader ? ({ "--reader-page-width": `${readerPageWidth}px` } as CSSProperties) : undefined}
         onClick={handleReaderPageClick}
@@ -4871,6 +6078,7 @@ function ReaderView({
         ))}
       </section>
       {!loading && (pages || error) && <ReaderControls placement="bottom" />}
+      <ReaderCommentsDrawer />
       <MobileReaderControls />
     </main>
   );
@@ -5443,6 +6651,7 @@ export function App() {
           id={view.id}
 	          favorites={favorites}
 	          readingProgress={readingProgress}
+            userRole={user?.role}
 	          showNsfw={showNsfw}
             shareUsers={shareUsers}
 	          onFavorite={handleFavorite}

@@ -2,6 +2,7 @@ import type {
   AccountUser,
   AdminDashboardStats,
   BookmarkUpdate,
+  CommentPage,
   ChapterPages,
   ChapterSummary,
   FavoriteManga,
@@ -352,6 +353,31 @@ export async function fetchChapterPages(source: string, id: string, mangaId?: st
   if (mangaId) params.set("mangaId", mangaId);
   if (chapterNumber) params.set("chapterNumber", chapterNumber);
   return apiRequest<ChapterPages>(`/api/chapter/${source}/${id}/pages?${params.toString()}`);
+}
+
+export async function fetchTitleComments(source: string, id: string, limit = 5, all = false) {
+  const params = new URLSearchParams({
+    sort: "newest",
+    limit: String(limit)
+  });
+  if (all) params.set("all", "true");
+  return apiRequest<CommentPage>(
+    `/api/comments/${encodeURIComponent(source)}/title/${encodeURIComponent(id)}?${params.toString()}`,
+    { clientCacheTtlMs: 1000 * 60 }
+  );
+}
+
+export async function fetchChapterComments(source: string, mangaId: string, chapterNumber: string, volume = "0", limit = 20, all = false) {
+  const params = new URLSearchParams({
+    sort: "newest",
+    volume,
+    limit: String(limit)
+  });
+  if (all) params.set("all", "true");
+  return apiRequest<CommentPage>(
+    `/api/comments/${encodeURIComponent(source)}/chapter/${encodeURIComponent(mangaId)}/${encodeURIComponent(chapterNumber)}?${params.toString()}`,
+    { clientCacheTtlMs: 1000 * 60 }
+  );
 }
 
 export async function prefetchChapterPages(chapters: Array<{ source: string; id: string }>) {

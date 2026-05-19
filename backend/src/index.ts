@@ -20,14 +20,17 @@ import {
   deleteRecommendation,
   deleteUser,
   destroySession,
+  enqueueBookmarkCommentDownloadsForRef,
   enqueueBookmarkDownloadJob,
   enqueueBookmarkDownloadsForAll,
   enqueueBookmarkDownloadsForRef,
+  enqueueChapterCommentDownloadJobsForChapters,
   enqueueChapterPageDownloadJobsForChapters,
   enqueueMissingChapterPageDownloadJobsForSavedChapterList,
   failBookmarkDownloadJob,
   getBookmarkUpdateLatest,
   getChapterPageCache,
+  getCommentCacheByTarget,
   getUserByToken,
   getChapterListCache,
   importFavorites,
@@ -54,7 +57,9 @@ import {
   upsertChapterListCache,
   upsertChapterPageCache,
   upsertBookmarkUpdateCache,
+  upsertCommentCache,
   unreadRecommendationCount,
+  type AdminDashboardStats,
   type BookmarkDownloadJobRecord,
   type UserRole
 } from "./accounts";
@@ -83,6 +88,19 @@ const port = Number(process.env.PORT ?? 4174);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const frontendRoot = path.resolve(projectRoot, "..", "frontend");
+const BOOKMARK_LATEST_CHECK_PRIORITY = 200;
+const BOOKMARK_LATEST_CHAPTERS_PRIORITY = 190;
+const BOOKMARK_TITLE_COMMENTS_PRIORITY = 5;
+const BOOKMARK_CHAPTER_COMMENTS_PRIORITY = 1;
+const BOOKMARK_JOB_TYPES = [
+  "title_detail",
+  "latest_check",
+  "chapter_list",
+  "latest_chapters",
+  "chapter_pages",
+  "title_comments",
+  "chapter_comments"
+] as const;
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -145,6 +163,61 @@ function optionalRequestString(value: unknown) {
 
 function optionalRequestNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function requestCommentSort(value: unknown) {
+  return value === "newest" || value === "oldest" ? value : "best";
+}
+
+function countCommentItems(comments: Array<{ replies?: unknown[] }>) {
+  let total = 0;
+  for (const comment of comments) {
+    total += 1;
+    if (Array.isArray(comment.replies)) total += countCommentItems(comment.replies as Array<{ replies?: unknown[] }>);
+  }
+  return total;
+}
+
+function normalizeCommentPageCounts<T extends { comments: Array<{ replies?: unknown[] }>; thread: object }>(page: T): T {
+  const mainCommentCount = page.comments.length;
+  const commentCount = countCommentItems(page.comments);
+  return {
+    ...page,
+    thread: {
+      ...page.thread,
+      commentCount,
+      mainCommentCount
+    }
+  };
+}
+
+function cachedCommentThreadIsComplete(page: { cursor?: string }) {
+  return !page.cursor;
+}
+
+function commentPreview(page: Awaited<ReturnType<typeof getCommentCacheByTarget>>, limit: number) {
+  if (!page) return undefined;
+  const normalized = normalizeCommentPageCounts(page);
+  return {
+    ...normalized,
+    comments: normalized.comments.slice(0, limit)
+  };
+}
+
+function requestLimit(value: unknown, fallback: number, max: number) {
+  const parsed = typeof value === "string" ? Number(value) : typeof value === "number" ? value : fallback;
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(Math.floor(parsed), max)) : fallback;
+}
+
+function bookmarkJobTypeFilter() {
+  const raw = process.env.BOOKMARK_DOWNLOAD_JOB_TYPES?.trim();
+  if (!raw) return undefined;
+  const allowed = new Set<string>(BOOKMARK_JOB_TYPES);
+  const jobTypes = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item): item is BookmarkDownloadJobRecord["jobType"] => allowed.has(item));
+  return jobTypes.length ? jobTypes : undefined;
 }
 
 function requestStringArray(value: unknown) {
@@ -398,6 +471,132 @@ function publicCache(res: express.Response, maxAgeSeconds: number) {
 
 function revalidateCache(res: express.Response) {
   res.set("Cache-Control", "private, no-cache, must-revalidate");
+}
+
+function envMs(name: string, fallback: number) {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function addMs(value: string | undefined, ms: number) {
+  if (!value || ms <= 0) return undefined;
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return undefined;
+  return new Date(time + ms).toISOString();
+}
+
+function recentActivityValue(dashboard: AdminDashboardStats, label: string) {
+  return dashboard.recentActivity.find((item) => item.label === label)?.value;
+}
+
+function buildRefreshSchedules(dashboard: AdminDashboardStats): NonNullable<AdminDashboardStats["refreshSchedules"]> {
+  const cacheWarmIntervalMs = envMs("CACHE_WARM_INTERVAL_MS", 1000 * 60 * 10);
+  const latestCheckIntervalMs = envMs("BOOKMARK_LATEST_CHECK_INTERVAL_MS", 1000 * 60 * 10);
+  const workerIntervalMs = envMs("BOOKMARK_DOWNLOAD_INTERVAL_MS", 5000);
+  const metadataRefreshIntervalMs = envMs("MANGAUPDATES_REFRESH_INTERVAL_MS", 1000 * 60 * 60);
+  const commentRefreshIntervalMs = envMs("BOOKMARK_COMMENT_REFRESH_INTERVAL_MS", 1000 * 60 * 60 * 24);
+  const compiledTitleTtlMs = envMs("COMPILED_TITLE_CACHE_TTL_MS", 1000 * 60 * 60 * 24);
+  const metadataTtlMs = envMs("MANGAUPDATES_METADATA_TTL_MS", 1000 * 60 * 60 * 24);
+  const chapterPageTtlMs = envMs("CHAPTER_PAGE_CACHE_TTL_MS", 1000 * 60 * 60 * 24 * 7);
+  const workerEnabled = process.env.BOOKMARK_DOWNLOAD_WORKER !== "0";
+  const runningJobs = dashboard.jobStatus.find((item) => item.status === "running")?.count ?? 0;
+  const commentJobs = dashboard.jobTypes.filter((item) => item.jobType === "title_comments" || item.jobType === "chapter_comments");
+  const commentPending = commentJobs.reduce((total, item) => total + item.pending, 0);
+  const commentRunning = commentJobs.reduce((total, item) => total + item.running, 0);
+  const commentFailed = commentJobs.reduce((total, item) => total + item.failed, 0);
+
+  return [
+    {
+      key: "home-latest-warmer",
+      label: "Home latest/search warmer",
+      status: cacheWarmIntervalMs <= 0 ? "Disabled" : cacheWarmRunning ? "Running" : "Enabled",
+      lastRefreshedAt: lastCacheWarmFinishedAt,
+      nextRefreshAt: cacheWarmIntervalMs > 0 ? nextCacheWarmAt : undefined,
+      intervalMs: cacheWarmIntervalMs > 0 ? cacheWarmIntervalMs : undefined,
+      detail: lastCacheWarmError
+        ? `Last error: ${lastCacheWarmError}`
+        : "Warms Comix home/latest search results and bookmarked title details in memory."
+    },
+    {
+      key: "bookmark-latest-check",
+      label: "Bookmark latest checks",
+      status: !workerEnabled
+        ? "Disabled here"
+        : latestCheckIntervalMs <= 0
+          ? "Disabled"
+          : bookmarkLatestCheckQueueRunning
+            ? "Queueing"
+            : bookmarkLatestCheckDrainRunning
+              ? "Running"
+              : "Enabled",
+      lastRefreshedAt: dashboard.jobActivity.latestCheckLastCompletedAt ?? lastBookmarkLatestCheckQueuedAt,
+      nextRefreshAt: workerEnabled && latestCheckIntervalMs > 0 ? dashboard.jobActivity.latestCheckNextQueuedAt ?? nextBookmarkLatestCheckAt : undefined,
+      intervalMs: workerEnabled && latestCheckIntervalMs > 0 ? latestCheckIntervalMs : undefined,
+      detail: lastBookmarkLatestCheckError
+        ? `Last error: ${lastBookmarkLatestCheckError}`
+        : "Checks only bookmarked titles for new latest chapters using a dedicated fast worker lane."
+    },
+    {
+      key: "bookmark-download-worker",
+      label: "Bookmark download worker",
+      status: workerEnabled ? (runningJobs > 0 ? "Running" : "Enabled") : runningJobs > 0 ? "External worker" : "Disabled here",
+      lastRefreshedAt: dashboard.jobActivity.workerLastCompletedAt,
+      nextRefreshAt: workerEnabled && workerIntervalMs > 0 ? new Date(Date.now() + workerIntervalMs).toISOString() : undefined,
+      intervalMs: workerEnabled && workerIntervalMs > 0 ? workerIntervalMs : undefined,
+      detail: "Processes queued title detail, chapter list, latest chapter, and chapter page URL jobs."
+    },
+    {
+      key: "bookmark-comment-refresh",
+      label: "Bookmark comment refresh",
+      status: commentRefreshIntervalMs <= 0
+        ? "Disabled"
+        : commentRunning > 0
+          ? "Running"
+          : commentPending > 0
+            ? "Queued"
+            : "Enabled",
+      lastRefreshedAt: recentActivityValue(dashboard, "Comix comments"),
+      nextRefreshAt: addMs(recentActivityValue(dashboard, "Comix comments"), commentRefreshIntervalMs),
+      intervalMs: commentRefreshIntervalMs > 0 ? commentRefreshIntervalMs : undefined,
+      detail: `Read-only Comix comments for bookmarked titles refresh daily at low priority. Pending: ${commentPending}, running: ${commentRunning}, failed: ${commentFailed}.`
+    },
+    {
+      key: "mangaupdates-refresh",
+      label: "Metadata refresh",
+      status: metadataRefreshIntervalMs <= 0 ? "Disabled" : "Enabled",
+      lastRefreshedAt: recentActivityValue(dashboard, "MangaUpdates metadata"),
+      nextRefreshAt: addMs(recentActivityValue(dashboard, "MangaUpdates metadata"), metadataRefreshIntervalMs),
+      intervalMs: metadataRefreshIntervalMs > 0 ? metadataRefreshIntervalMs : undefined,
+      detail: `Scheduler scans stored title metadata rows older than ${Math.round(metadataTtlMs / (1000 * 60 * 60))} hours and enriches them with MangaUpdates, MyAnimeList, and AniList.`
+    },
+    {
+      key: "title-detail-db",
+      label: "Title detail DB storage",
+      status: "On demand",
+      lastRefreshedAt: recentActivityValue(dashboard, "Title detail cache"),
+      nextRefreshAt: addMs(recentActivityValue(dashboard, "Title detail cache"), compiledTitleTtlMs),
+      intervalMs: compiledTitleTtlMs,
+      detail: "A stale title is returned immediately, then refreshed in the background when opened."
+    },
+    {
+      key: "chapter-list-db",
+      label: "Chapter list DB storage",
+      status: "On demand",
+      lastRefreshedAt: recentActivityValue(dashboard, "Chapter list cache"),
+      nextRefreshAt: addMs(recentActivityValue(dashboard, "Chapter list cache"), cacheTtl.chapters),
+      intervalMs: cacheTtl.chapters,
+      detail: "A saved list older than this is returned first, then refreshed in the background."
+    },
+    {
+      key: "chapter-page-db",
+      label: "Chapter page URL DB storage",
+      status: "On demand",
+      lastRefreshedAt: recentActivityValue(dashboard, "Chapter page cache"),
+      nextRefreshAt: addMs(recentActivityValue(dashboard, "Chapter page cache"), chapterPageTtlMs),
+      intervalMs: chapterPageTtlMs,
+      detail: "Stores image URLs for chapters. Old rows are served immediately and refreshed after this age."
+    }
+  ];
 }
 
 function sizeLimitStream(maxBytes: number) {
@@ -908,6 +1107,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string) {
   });
 }
 
+let cacheWarmRunning = false;
+let lastCacheWarmStartedAt: string | undefined;
+let lastCacheWarmFinishedAt: string | undefined;
+let lastCacheWarmError: string | undefined;
+let nextCacheWarmAt: string | undefined;
+
 async function warmSourceCache() {
   const warmStartedAt = Date.now();
   let warmed = 0;
@@ -982,14 +1187,24 @@ function startCacheWarmer() {
   const intervalMs = Number(process.env.CACHE_WARM_INTERVAL_MS ?? 1000 * 60 * 10);
   if (intervalMs <= 0) return;
 
-  let running = false;
+  nextCacheWarmAt = new Date(Date.now() + 2500).toISOString();
   const run = () => {
-    if (running) return;
-    running = true;
+    if (cacheWarmRunning) return;
+    cacheWarmRunning = true;
+    lastCacheWarmStartedAt = new Date().toISOString();
+    nextCacheWarmAt = undefined;
     warmSourceCache()
-      .catch((error: Error) => console.warn("Cache warm failed:", error.message))
+      .then(() => {
+        lastCacheWarmError = undefined;
+      })
+      .catch((error: Error) => {
+        lastCacheWarmError = error.message;
+        console.warn("Cache warm failed:", error.message);
+      })
       .finally(() => {
-        running = false;
+        cacheWarmRunning = false;
+        lastCacheWarmFinishedAt = new Date().toISOString();
+        nextCacheWarmAt = new Date(Date.now() + intervalMs).toISOString();
       });
   };
 
@@ -1000,10 +1215,26 @@ function startCacheWarmer() {
 async function enqueueLatestCheckJobs() {
   const refs = await listFavoriteRefs(Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500));
   for (const ref of refs) {
-    await enqueueBookmarkDownloadJob({ jobType: "latest_check", ...ref, priority: 30 });
+    await enqueueBookmarkDownloadJob({ jobType: "latest_check", ...ref, priority: BOOKMARK_LATEST_CHECK_PRIORITY });
   }
   return refs.length;
 }
+
+async function enqueueBookmarkCommentRefreshJobs(refreshExisting = true) {
+  const refs = await listFavoriteRefs(Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500));
+  let queued = 0;
+  for (const ref of refs) {
+    queued += await enqueueBookmarkCommentDownloadsForRef(ref, BOOKMARK_TITLE_COMMENTS_PRIORITY, refreshExisting);
+  }
+  return { titles: refs.length, jobs: queued };
+}
+
+let bookmarkLatestCheckQueueRunning = false;
+let bookmarkLatestCheckDrainRunning = false;
+let lastBookmarkLatestCheckQueuedAt: string | undefined;
+let lastBookmarkLatestCheckError: string | undefined;
+let nextBookmarkLatestCheckAt: string | undefined;
+let bookmarkCommentQueueRunning = false;
 
 async function runLatestCheckJob(source: MangaSource, job: BookmarkDownloadJobRecord) {
   const previous = await getBookmarkUpdateLatest(job.source, job.mangaId).catch(() => undefined);
@@ -1028,7 +1259,7 @@ async function runLatestCheckJob(source: MangaSource, job: BookmarkDownloadJobRe
       mangaId: job.mangaId,
       canonicalKey: job.canonicalKey ?? manga.canonicalKey,
       language: job.language,
-      priority: 40
+      priority: BOOKMARK_LATEST_CHAPTERS_PRIORITY
     });
   }
 }
@@ -1052,6 +1283,12 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
       { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
       chapters,
       Math.max(50, job.priority + 1)
+    );
+    await enqueueChapterCommentDownloadJobsForChapters(
+      { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+      chapters,
+      BOOKMARK_CHAPTER_COMMENTS_PRIORITY,
+      false
     );
     return;
   }
@@ -1079,6 +1316,12 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
         { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
         newChapters,
         Math.max(50, job.priority + 1)
+      );
+      await enqueueChapterCommentDownloadJobsForChapters(
+        { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+        newChapters,
+        BOOKMARK_CHAPTER_COMMENTS_PRIORITY,
+        false
       );
     }
     return;
@@ -1113,6 +1356,54 @@ async function runLatestChaptersJob(source: MangaSource, job: BookmarkDownloadJo
     newChapters,
     Math.max(50, job.priority + 1)
   );
+  await enqueueChapterCommentDownloadJobsForChapters(
+    { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+    newChapters,
+    BOOKMARK_CHAPTER_COMMENTS_PRIORITY,
+    false
+  );
+}
+
+function commentJobVolume(chapterId?: string) {
+  const match = chapterId?.match(/:vol:([^:]+)$/);
+  if (!match) return "0";
+  try {
+    return decodeURIComponent(match[1]) || "0";
+  } catch {
+    return "0";
+  }
+}
+
+async function runTitleCommentsJob(source: MangaSource, job: BookmarkDownloadJobRecord) {
+  if (!source.getTitleComments) return;
+  const page = await withTimeout(
+    source.getTitleComments(job.mangaId, {
+      sort: "newest",
+      limit: Number(process.env.BOOKMARK_COMMENT_PAGE_LIMIT ?? 20),
+      all: process.env.BOOKMARK_COMMENT_FETCH_ALL !== "0"
+    }),
+    Number(process.env.BOOKMARK_COMMENT_TIMEOUT_MS ?? 30000),
+    `${source.info.name} title comments download`
+  );
+  await upsertCommentCache({ page });
+  return { comments: page.comments.length };
+}
+
+async function runChapterCommentsJob(source: MangaSource, job: BookmarkDownloadJobRecord) {
+  if (!source.getChapterComments) return;
+  if (!job.chapterNumber) throw new Error("Chapter comment download job is missing chapter number.");
+  const page = await withTimeout(
+    source.getChapterComments(job.mangaId, job.chapterNumber, {
+      volume: commentJobVolume(job.chapterId),
+      sort: "newest",
+      limit: Number(process.env.BOOKMARK_COMMENT_PAGE_LIMIT ?? 20),
+      all: process.env.BOOKMARK_COMMENT_FETCH_ALL !== "0"
+    }),
+    Number(process.env.BOOKMARK_COMMENT_TIMEOUT_MS ?? 30000),
+    `${source.info.name} chapter comments download`
+  );
+  await upsertCommentCache({ page });
+  return { comments: page.comments.length };
 }
 
 async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
@@ -1127,6 +1418,14 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
   if (job.jobType === "latest_chapters") {
     await runLatestChaptersJob(source, job);
     return;
+  }
+
+  if (job.jobType === "title_comments") {
+    return runTitleCommentsJob(source, job);
+  }
+
+  if (job.jobType === "chapter_comments") {
+    return runChapterCommentsJob(source, job);
   }
 
   if (job.jobType === "title_detail") {
@@ -1158,6 +1457,12 @@ async function processBookmarkDownloadJob(job: BookmarkDownloadJobRecord) {
       chapters,
       Math.max(50, job.priority + 1)
     );
+    await enqueueChapterCommentDownloadJobsForChapters(
+      { source: job.source, mangaId: job.mangaId, canonicalKey: job.canonicalKey, language: job.language },
+      chapters,
+      BOOKMARK_CHAPTER_COMMENTS_PRIORITY,
+      false
+    );
     return;
   }
 
@@ -1187,12 +1492,70 @@ function startBookmarkDownloadWorker() {
   const workerConcurrency = Math.max(Math.min(Number(process.env.BOOKMARK_DOWNLOAD_WORKER_CONCURRENCY ?? 1) || 1, 16), 1);
   const backfillLimit = Number(process.env.BOOKMARK_DOWNLOAD_BACKFILL_LIMIT ?? 500);
   const latestIntervalMs = Number(process.env.BOOKMARK_LATEST_CHECK_INTERVAL_MS ?? 1000 * 60 * 10);
+  const commentRefreshIntervalMs = Number(process.env.BOOKMARK_COMMENT_REFRESH_INTERVAL_MS ?? 1000 * 60 * 60 * 24);
+  const latestCheckConcurrency = Math.max(Math.min(Number(process.env.BOOKMARK_LATEST_CHECK_WORKER_CONCURRENCY ?? 4) || 0, 16), 0);
+  const latestCheckBatchSize = Math.max(
+    Math.min(Number(process.env.BOOKMARK_LATEST_CHECK_BATCH_SIZE ?? latestCheckConcurrency) || latestCheckConcurrency, 25),
+    1
+  );
+  const commentWorkerConcurrency = Math.max(Math.min(Number(process.env.BOOKMARK_COMMENT_WORKER_CONCURRENCY ?? 4) || 0, 16), 0);
+  const commentWorkerBatchSize = Math.max(Math.min(Number(process.env.BOOKMARK_COMMENT_WORKER_BATCH_SIZE ?? 1) || 1, 25), 1);
+  const commentWorkerIntervalMs = Math.max(Number(process.env.BOOKMARK_COMMENT_WORKER_INTERVAL_MS ?? 1000) || 1000, 250);
   const staleJobTimeoutMs = Number(process.env.BOOKMARK_DOWNLOAD_STALE_JOB_TIMEOUT_MS ?? 1000 * 60 * 20);
   const progressLog = process.env.BOOKMARK_DOWNLOAD_PROGRESS_LOG === "1";
   const progressIntervalMs = Number(process.env.BOOKMARK_DOWNLOAD_PROGRESS_INTERVAL_MS ?? 30000);
+  const workerJobTypes = bookmarkJobTypeFilter();
 
   const jobLabel = (job: BookmarkDownloadJobRecord) =>
     `${job.jobType} ${job.source}:${job.mangaId}${job.chapterNumber ? ` ch.${job.chapterNumber}` : ""}${job.chapterId ? ` ${job.chapterId}` : ""}`;
+
+  const processClaimedJob = async (job: BookmarkDownloadJobRecord, laneLabel: string) => {
+    const startedAt = Date.now();
+    try {
+      const result = await processBookmarkDownloadJob(job);
+      await completeBookmarkDownloadJob(job.id);
+      if (progressLog) {
+        const pages = result && "pages" in result && result.pages !== undefined ? ` pages=${result.pages}` : "";
+        const comments = result && "comments" in result && result.comments !== undefined ? ` comments=${result.comments}` : "";
+        console.log(`[bookmark-worker:${laneLabel}] done ${jobLabel(job)}${pages}${comments} in ${Date.now() - startedAt}ms`);
+      }
+    } catch (error) {
+      await failBookmarkDownloadJob(job, error);
+      if (progressLog) {
+        console.warn(
+          `[bookmark-worker:${laneLabel}] failed ${jobLabel(job)} in ${Date.now() - startedAt}ms: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+  };
+
+  const drainLatestCheckJobs = async (reason: string) => {
+    if (latestCheckConcurrency <= 0 || bookmarkLatestCheckDrainRunning) return;
+    bookmarkLatestCheckDrainRunning = true;
+    const startedAt = Date.now();
+    let drained = 0;
+    try {
+      while (true) {
+        const jobs = await claimBookmarkDownloadJobs(
+          Math.min(latestCheckBatchSize, latestCheckConcurrency),
+          `${workerId}-latest-check`,
+          ["latest_check"]
+        );
+        if (!jobs.length) break;
+        drained += jobs.length;
+        await Promise.all(jobs.map((job, index) => processClaimedJob(job, `latest:${index}`)));
+      }
+      if (drained) {
+        console.log(`Bookmark latest checks drained ${drained} jobs in ${Date.now() - startedAt}ms${reason ? ` (${reason})` : ""}.`);
+      }
+    } catch (error) {
+      console.warn("Bookmark latest check drain failed:", error instanceof Error ? error.message : String(error));
+    } finally {
+      bookmarkLatestCheckDrainRunning = false;
+    }
+  };
 
   const createWorkerRun = (lane: number) => {
     const laneWorkerId = workerConcurrency > 1 ? `${workerId}-${lane}` : workerId;
@@ -1205,29 +1568,33 @@ function startBookmarkDownloadWorker() {
           const recovered = await resetStaleBookmarkDownloadJobs(staleJobTimeoutMs);
           if (recovered) console.log(`Bookmark download worker recovered ${recovered} stale jobs.`);
         }
-        const jobs = await claimBookmarkDownloadJobs(batchSize, laneWorkerId);
-        await Promise.all(jobs.map(async (job) => {
-          const startedAt = Date.now();
-          try {
-            const result = await processBookmarkDownloadJob(job);
-            await completeBookmarkDownloadJob(job.id);
-            if (progressLog) {
-              const pages = result?.pages !== undefined ? ` pages=${result.pages}` : "";
-              console.log(`[bookmark-worker:${lane}] done ${jobLabel(job)}${pages} in ${Date.now() - startedAt}ms`);
-            }
-          } catch (error) {
-            await failBookmarkDownloadJob(job, error);
-            if (progressLog) {
-              console.warn(
-                `[bookmark-worker:${lane}] failed ${jobLabel(job)} in ${Date.now() - startedAt}ms: ${
-                  error instanceof Error ? error.message : String(error)
-                }`
-              );
-            }
-          }
-        }));
+        const jobs = await claimBookmarkDownloadJobs(batchSize, laneWorkerId, workerJobTypes);
+        await Promise.all(jobs.map((job) => processClaimedJob(job, String(lane))));
       } catch (error) {
         console.warn("Bookmark download worker failed:", error instanceof Error ? error.message : String(error));
+      } finally {
+        running = false;
+      }
+    };
+  };
+
+  const createCommentWorkerRun = (lane: number) => {
+    const laneWorkerId = `${workerId}-comments-${lane}`;
+    let running = false;
+    return async () => {
+      if (running) return;
+      running = true;
+      try {
+        const titleJobs = await claimBookmarkDownloadJobs(commentWorkerBatchSize, `${laneWorkerId}-titles`, ["title_comments"]);
+        const remaining = commentWorkerBatchSize - titleJobs.length;
+        const chapterJobs =
+          remaining > 0
+            ? await claimBookmarkDownloadJobs(remaining, `${laneWorkerId}-chapters`, ["chapter_comments"])
+            : [];
+        const jobs = [...titleJobs, ...chapterJobs];
+        await Promise.all(jobs.map((job) => processClaimedJob(job, `comments:${lane}`)));
+      } catch (error) {
+        console.warn("Bookmark comment worker failed:", error instanceof Error ? error.message : String(error));
       } finally {
         running = false;
       }
@@ -1245,9 +1612,29 @@ function startBookmarkDownloadWorker() {
     startWorkerLane(lane);
   }
 
+  if (commentWorkerConcurrency > 0) {
+    for (let lane = 0; lane < commentWorkerConcurrency; lane += 1) {
+      const run = createCommentWorkerRun(lane);
+      const staggerMs = Math.min(commentWorkerIntervalMs, 1000) * lane;
+      setTimeout(run, 9000 + staggerMs);
+      setInterval(run, commentWorkerIntervalMs);
+    }
+  }
+
   console.log(
-    `Bookmark download worker started: concurrency=${workerConcurrency}, batchSize=${Math.max(Math.min(Math.floor(batchSize), 25), 1)}, intervalMs=${intervalMs}`
+    `Bookmark download worker started: concurrency=${workerConcurrency}, batchSize=${Math.max(Math.min(Math.floor(batchSize), 25), 1)}, intervalMs=${intervalMs}${
+      workerJobTypes?.length ? `, jobTypes=${workerJobTypes.join(",")}` : ""
+    }`
   );
+  if (commentWorkerConcurrency > 0) {
+    console.log(
+      `Bookmark comment worker started: concurrency=${commentWorkerConcurrency}, batchSize=${commentWorkerBatchSize}, intervalMs=${commentWorkerIntervalMs}`
+    );
+  }
+  if (latestCheckConcurrency > 0) {
+    console.log(`Bookmark latest check fast worker started: concurrency=${latestCheckConcurrency}, batchSize=${latestCheckBatchSize}`);
+    setTimeout(() => void drainLatestCheckJobs("startup"), 9000);
+  }
 
   if (progressLog && progressIntervalMs > 0) {
     setInterval(() => {
@@ -1282,12 +1669,49 @@ function startBookmarkDownloadWorker() {
     }, 5000);
   }
 
+  if (process.env.BOOKMARK_COMMENT_BACKFILL_ON_START === "1") {
+    setTimeout(() => {
+      enqueueBookmarkCommentRefreshJobs(false)
+        .then(({ titles, jobs }) => console.log(`Bookmark comment backfill queued ${jobs} jobs for ${titles} titles.`))
+        .catch((error: Error) => console.warn("Bookmark comment backfill failed:", error.message));
+    }, 5000);
+  }
+
   if (latestIntervalMs > 0) {
+    nextBookmarkLatestCheckAt = new Date(Date.now() + latestIntervalMs).toISOString();
     setInterval(() => {
+      if (bookmarkLatestCheckQueueRunning) return;
+      bookmarkLatestCheckQueueRunning = true;
+      nextBookmarkLatestCheckAt = undefined;
       enqueueLatestCheckJobs()
-        .then((count) => console.log(`Bookmark latest checks queued ${count} titles.`))
-        .catch((error: Error) => console.warn("Bookmark latest check queue failed:", error.message));
+        .then((count) => {
+          lastBookmarkLatestCheckQueuedAt = new Date().toISOString();
+          lastBookmarkLatestCheckError = undefined;
+          console.log(`Bookmark latest checks queued ${count} titles.`);
+          void drainLatestCheckJobs("scheduled");
+        })
+        .catch((error: Error) => {
+          lastBookmarkLatestCheckError = error.message;
+          console.warn("Bookmark latest check queue failed:", error.message);
+        })
+        .finally(() => {
+          bookmarkLatestCheckQueueRunning = false;
+          nextBookmarkLatestCheckAt = new Date(Date.now() + latestIntervalMs).toISOString();
+        });
     }, latestIntervalMs);
+  }
+
+  if (commentRefreshIntervalMs > 0) {
+    setInterval(() => {
+      if (bookmarkCommentQueueRunning) return;
+      bookmarkCommentQueueRunning = true;
+      enqueueBookmarkCommentRefreshJobs(true)
+        .then(({ titles, jobs }) => console.log(`Bookmark comment refresh queued ${jobs} jobs for ${titles} titles.`))
+        .catch((error: Error) => console.warn("Bookmark comment refresh queue failed:", error.message))
+        .finally(() => {
+          bookmarkCommentQueueRunning = false;
+        });
+    }, commentRefreshIntervalMs);
   }
 }
 
@@ -1422,7 +1846,9 @@ app.get(
   "/api/admin/dashboard",
   asyncRoute(async (req, res) => {
     if (!(await requireAdmin(req, res))) return;
-    res.json({ dashboard: await adminDashboardStats(), cache: cacheStats() });
+    const dashboard = await adminDashboardStats();
+    dashboard.refreshSchedules = buildRefreshSchedules(dashboard);
+    res.json({ dashboard, cache: cacheStats() });
   })
 );
 
@@ -1838,6 +2264,79 @@ app.get(
     const chapters = await getCanonicalChapters(req.params.canonicalId, language);
     publicCache(res, 300);
     res.json({ chapters });
+  })
+);
+
+app.get(
+  "/api/comments/:source/title/:id",
+  asyncRoute(async (req, res) => {
+    const source = sourceOr404(req.params.source);
+    if (!source.getTitleComments) {
+      res.status(404).json({ error: "Comments are not available for this source." });
+      return;
+    }
+    const limit = requestLimit(req.query.limit, 5, 50);
+    const wantsAll = req.query.all === "true";
+    const cachedPage = await getCommentCacheByTarget({
+      source: req.params.source,
+      targetType: "title",
+      mangaId: req.params.id
+    }).catch(() => undefined);
+    if (cachedPage && (!wantsAll || cachedCommentThreadIsComplete(cachedPage))) {
+      publicCache(res, 60);
+      res.json(wantsAll ? normalizeCommentPageCounts(cachedPage) : commentPreview(cachedPage, limit));
+      return;
+    }
+    const page = normalizeCommentPageCounts(await source.getTitleComments(req.params.id, {
+      sort: requestCommentSort(req.query.sort),
+      limit,
+      all: wantsAll
+    }));
+    await upsertCommentCache({ page }).catch((error: Error) =>
+      console.warn(`Comment cache save failed for ${req.params.source}:${req.params.id}:`, error.message)
+    );
+    publicCache(res, 60);
+    res.json(normalizeCommentPageCounts(page));
+  })
+);
+
+app.get(
+  "/api/comments/:source/chapter/:mangaId/:chapterNumber",
+  asyncRoute(async (req, res) => {
+    const source = sourceOr404(req.params.source);
+    if (!source.getChapterComments) {
+      res.status(404).json({ error: "Comments are not available for this source." });
+      return;
+    }
+    const volume = typeof req.query.volume === "string" ? req.query.volume : "0";
+    const limit = requestLimit(req.query.limit, 5, 50);
+    const wantsAll = req.query.all === "true";
+    const cachedPage = await getCommentCacheByTarget({
+      source: req.params.source,
+      targetType: "chapter",
+      mangaId: req.params.mangaId,
+      chapterNumber: req.params.chapterNumber,
+      volume
+    }).catch(() => undefined);
+    if (cachedPage && (!wantsAll || cachedCommentThreadIsComplete(cachedPage))) {
+      publicCache(res, 60);
+      res.json(wantsAll ? normalizeCommentPageCounts(cachedPage) : commentPreview(cachedPage, limit));
+      return;
+    }
+    const page = normalizeCommentPageCounts(await source.getChapterComments(req.params.mangaId, req.params.chapterNumber, {
+      volume,
+      sort: requestCommentSort(req.query.sort),
+      limit,
+      all: wantsAll
+    }));
+    await upsertCommentCache({ page }).catch((error: Error) =>
+      console.warn(
+        `Comment cache save failed for ${req.params.source}:${req.params.mangaId}:ch.${req.params.chapterNumber}:`,
+        error.message
+      )
+    );
+    publicCache(res, 60);
+    res.json(normalizeCommentPageCounts(page));
   })
 );
 

@@ -8,6 +8,9 @@ import { promisify } from "node:util";
 import type {
   ChapterPages,
   ChapterSummary,
+  CommentItem,
+  CommentPage,
+  CommentSort,
   MangaDetail,
   MangaSource,
   MangaSummary,
@@ -102,6 +105,66 @@ type ComixChapter = {
 
 type ComixPage = {
   url: string;
+};
+
+type ComixCommentUser = {
+  id?: number | string;
+  name?: string;
+  username?: string;
+  avatar?: string;
+  avatarUrl?: string;
+  avatar_url?: string;
+};
+
+type ComixComment = {
+  id?: number | string;
+  parentId?: number | string;
+  parent_id?: number | string;
+  user?: ComixCommentUser;
+  contentHtml?: string;
+  content_html?: string;
+  likeCount?: number;
+  like_count?: number;
+  dislikeCount?: number;
+  dislike_count?: number;
+  replyCount?: number;
+  reply_count?: number;
+  isPinned?: boolean;
+  is_pinned?: boolean;
+  isEdited?: boolean;
+  is_edited?: boolean;
+  createdAt?: string;
+  created_at?: string;
+  createdAtFormatted?: string;
+  created_at_formatted?: string;
+  replies?: ComixComment[];
+};
+
+type ComixThread = {
+  id?: number | string;
+  pageIdentifier?: string;
+  page_identifier?: string;
+  pageUrl?: string;
+  page_url?: string;
+  pageTitle?: string;
+  page_title?: string;
+  commentCount?: number;
+  comment_count?: number;
+  mainCommentCount?: number;
+  main_comment_count?: number;
+  isClosed?: boolean;
+  is_closed?: boolean;
+};
+
+type ComixThreadLookup = {
+  thread?: ComixThread;
+};
+
+type ComixCommentList = {
+  thread?: ComixThread;
+  count?: number;
+  items?: ComixComment[];
+  cursor?: string;
 };
 
 function comixPageUrls(value: unknown): string[] {
@@ -313,6 +376,195 @@ function titleUrl(id: string) {
 
 function chapterPageUrl(mangaId: string, chapterId: string, chapterNumber: string) {
   return `${SITE_BASE}/title/${mangaId}/${chapterId}-chapter-${encodeURIComponent(chapterNumber)}`;
+}
+
+function relativeComixUrl(url: string) {
+  try {
+    const parsed = new URL(url, SITE_BASE);
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return url.startsWith("/") ? url : `/${url}`;
+  }
+}
+
+function normalizedCommentSort(value?: CommentSort): CommentSort {
+  return value === "newest" || value === "oldest" ? value : "best";
+}
+
+function normalizedCommentLimit(value?: number) {
+  const limit = Math.floor(Number(value ?? 20));
+  return Number.isFinite(limit) ? Math.max(1, Math.min(limit, 50)) : 20;
+}
+
+function commentUser(user?: ComixCommentUser) {
+  if (!user) return undefined;
+  return {
+    id: user.id === undefined ? undefined : String(user.id),
+    name: user.name ?? user.username,
+    avatarUrl: user.avatarUrl ?? user.avatar_url ?? user.avatar
+  };
+}
+
+function commentItem(comment: ComixComment): CommentItem {
+  return {
+    id: String(comment.id ?? ""),
+    parentId: comment.parentId === undefined && comment.parent_id === undefined ? undefined : String(comment.parentId ?? comment.parent_id),
+    user: commentUser(comment.user),
+    contentHtml: comment.contentHtml ?? comment.content_html ?? "",
+    likeCount: comment.likeCount ?? comment.like_count,
+    dislikeCount: comment.dislikeCount ?? comment.dislike_count,
+    replyCount: comment.replyCount ?? comment.reply_count,
+    isPinned: comment.isPinned ?? comment.is_pinned,
+    isEdited: comment.isEdited ?? comment.is_edited,
+    createdAt: comment.createdAt ?? comment.created_at,
+    createdAtFormatted: comment.createdAtFormatted ?? comment.created_at_formatted,
+    replies: (comment.replies ?? []).map(commentItem).filter((item) => item.id)
+  };
+}
+
+function commentThreadKey(thread: ComixThread | undefined, fallback: string) {
+  return String(thread?.pageIdentifier ?? thread?.page_identifier ?? fallback);
+}
+
+function commentThreadId(thread: ComixThread | undefined) {
+  return String(thread?.id ?? "");
+}
+
+function commentPageUrl(thread: ComixThread | undefined) {
+  return thread?.pageUrl ?? thread?.page_url;
+}
+
+function commentPageTitle(thread: ComixThread | undefined) {
+  return thread?.pageTitle ?? thread?.page_title;
+}
+
+function commentCount(thread: ComixThread | undefined) {
+  return thread?.commentCount ?? thread?.comment_count;
+}
+
+function mainCommentCount(thread: ComixThread | undefined) {
+  return thread?.mainCommentCount ?? thread?.main_comment_count;
+}
+
+function isCommentThreadClosed(thread: ComixThread | undefined) {
+  return thread?.isClosed ?? thread?.is_closed;
+}
+
+async function comixMangaForId(id: string) {
+  const currentId = await resolveCurrentMangaId(id);
+  return request<ComixManga>(`/manga/${hashFromId(currentId)}`, mangaIncludeParams());
+}
+
+async function lookupCommentThread(pageIdentifier: string, pageUrl: string) {
+  const params = new URLSearchParams({
+    page_identifier: pageIdentifier,
+    page_url: relativeComixUrl(pageUrl)
+  });
+  const result = await request<ComixThreadLookup>("/threads/lookup", params);
+  const thread = result.thread;
+  if (!commentThreadId(thread)) throw new Error("Comix.to comment thread was not found.");
+  return thread;
+}
+
+async function loadThreadComments(
+  threadId: string,
+  referer: string,
+  options: { sort?: CommentSort; limit?: number; all?: boolean } = {}
+) {
+  const sort = normalizedCommentSort(options.sort);
+  const limit = normalizedCommentLimit(options.limit);
+  const maxComments = options.all
+    ? Math.max(limit, Math.min(Number(process.env.COMIX_COMMENT_MAX_COMMENTS_PER_THREAD ?? 200) || 200, 1000))
+    : limit;
+  const comments: CommentItem[] = [];
+  let cursor: string | undefined;
+  let thread: ComixThread | undefined;
+
+  while (comments.length < maxComments) {
+    const params = new URLSearchParams({
+      sort,
+      limit: String(Math.min(limit, maxComments - comments.length))
+    });
+    if (cursor) params.set("cursor", cursor);
+    const page = await request<ComixCommentList>(`/threads/${threadId}/comments`, params);
+    thread ??= page.thread;
+    const items = (page.items ?? []).map(commentItem).filter((item) => item.id);
+    comments.push(...items);
+    cursor = page.cursor;
+    if (!options.all || !cursor || !items.length) break;
+  }
+
+  return { comments, cursor, sort, thread };
+}
+
+async function getComixTitleComments(
+  mangaId: string,
+  options: { sort?: CommentSort; limit?: number; all?: boolean } = {}
+): Promise<CommentPage> {
+  const manga = await comixMangaForId(mangaId);
+  const currentId = sourceId(manga);
+  const numericId = String(manga.id ?? manga.manga_id ?? "");
+  if (!numericId) throw new Error("Comix.to numeric manga id was not found for comments.");
+  const pageIdentifier = `manga${numericId}`;
+  const pageUrl = manga.url ?? `/title/${currentId}`;
+  const lookupThread = await lookupCommentThread(pageIdentifier, pageUrl);
+  const threadId = commentThreadId(lookupThread);
+  const loaded = await loadThreadComments(threadId, `${SITE_BASE}${relativeComixUrl(pageUrl)}`, options);
+  const thread = loaded.thread ?? lookupThread;
+  return {
+    source: "comix",
+    targetType: "title",
+    mangaId: currentId,
+    thread: {
+      id: threadId,
+      key: commentThreadKey(thread, pageIdentifier),
+      pageUrl: commentPageUrl(thread) ?? relativeComixUrl(pageUrl),
+      pageTitle: commentPageTitle(thread),
+      commentCount: commentCount(thread),
+      mainCommentCount: mainCommentCount(thread),
+      isClosed: isCommentThreadClosed(thread)
+    },
+    comments: loaded.comments,
+    sort: loaded.sort,
+    cursor: loaded.cursor
+  };
+}
+
+async function getComixChapterComments(
+  mangaId: string,
+  chapterNumber: string,
+  options: { volume?: string; sort?: CommentSort; limit?: number; all?: boolean } = {}
+): Promise<CommentPage> {
+  const manga = await comixMangaForId(mangaId);
+  const currentId = sourceId(manga);
+  const numericId = String(manga.id ?? manga.manga_id ?? "");
+  if (!numericId) throw new Error("Comix.to numeric manga id was not found for comments.");
+  const volume = options.volume ?? "0";
+  const pageIdentifier = `manga${numericId}_chap${chapterNumber}_vol${volume || "0"}`;
+  const pageUrl = `/title/${currentId}`;
+  const lookupThread = await lookupCommentThread(pageIdentifier, pageUrl);
+  const threadId = commentThreadId(lookupThread);
+  const loaded = await loadThreadComments(threadId, `${SITE_BASE}${relativeComixUrl(pageUrl)}`, options);
+  const thread = loaded.thread ?? lookupThread;
+  return {
+    source: "comix",
+    targetType: "chapter",
+    mangaId: currentId,
+    chapterNumber,
+    volume,
+    thread: {
+      id: threadId,
+      key: commentThreadKey(thread, pageIdentifier),
+      pageUrl: commentPageUrl(thread) ?? relativeComixUrl(pageUrl),
+      pageTitle: commentPageTitle(thread),
+      commentCount: commentCount(thread),
+      mainCommentCount: mainCommentCount(thread),
+      isClosed: isCommentThreadClosed(thread)
+    },
+    comments: loaded.comments,
+    sort: loaded.sort,
+    cursor: loaded.cursor
+  };
 }
 
 function tags(manga: ComixManga) {
@@ -1763,5 +2015,17 @@ export const comixSource: MangaSource = {
       id,
       pages
     };
+  },
+
+  async getTitleComments(mangaId: string, options?: { sort?: CommentSort; limit?: number; all?: boolean }) {
+    return getComixTitleComments(mangaId, options);
+  },
+
+  async getChapterComments(
+    mangaId: string,
+    chapterNumber: string,
+    options?: { volume?: string; sort?: CommentSort; limit?: number; all?: boolean }
+  ) {
+    return getComixChapterComments(mangaId, chapterNumber, options);
   }
 };

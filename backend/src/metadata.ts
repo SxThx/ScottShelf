@@ -47,8 +47,12 @@ type RatingDistribution = Array<{ rating: number; count: number }>;
 
 type StoredMetadata = {
   mangaUpdatesId: string;
+  anilistId?: string;
+  myAnimeListId?: string;
   title: string;
   url?: string;
+  anilistUrl?: string;
+  myAnimeListUrl?: string;
   description?: string;
   coverUrl?: string;
   type?: string;
@@ -71,8 +75,12 @@ type StoredMetadata = {
 
 interface MetadataRow extends RowDataPacket {
   manga_updates_id: string | number;
+  anilist_id: string | number | null;
+  myanimelist_id: string | number | null;
   title: string;
   url: string | null;
+  anilist_url: string | null;
+  myanimelist_url: string | null;
   description: string | null;
   cover_url: string | null;
   type: string | null;
@@ -162,6 +170,7 @@ const metadataFreshMs = Number(process.env.MANGAUPDATES_METADATA_TTL_MS ?? 1000 
 const compiledTitleFreshMs = Number(process.env.COMPILED_TITLE_CACHE_TTL_MS ?? 1000 * 60 * 60 * 24);
 const refreshIntervalMs = Number(process.env.MANGAUPDATES_REFRESH_INTERVAL_MS ?? 1000 * 60 * 60);
 const refreshBatchSize = Number(process.env.MANGAUPDATES_REFRESH_BATCH_SIZE ?? 20);
+const externalMetadataTimeoutMs = Number(process.env.EXTERNAL_METADATA_TIMEOUT_MS ?? 8000);
 const fallbackGenres = [
   "Action",
   "Adventure",
@@ -237,6 +246,23 @@ async function ensureJsonColumn(db: Pool, table: string, column: string, afterCo
 
   await db.query(`ALTER TABLE ${table} ADD COLUMN ${column} JSON NULL AFTER ${afterColumn}`);
   await db.query(`UPDATE ${table} SET ${column} = JSON_ARRAY() WHERE ${column} IS NULL`);
+}
+
+async function ensureColumn(db: Pool, table: string, column: string, definition: string, afterColumn: string) {
+  const [rows] = await db.execute<RowDataPacket[]>(
+    `
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `,
+    [table, column]
+  );
+  if (rows.length) return;
+
+  await db.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition} AFTER ${afterColumn}`);
 }
 
 function parseRatingDistribution(value: unknown): RatingDistribution | undefined {
@@ -359,6 +385,310 @@ function mangaUpdatesSearchTerms(manga: MangaDetail) {
   return uniqueStrings(expanded).slice(0, 5);
 }
 
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type ExternalMetadata = {
+  anilistId?: string;
+  myAnimeListId?: string;
+  anilistUrl?: string;
+  myAnimeListUrl?: string;
+  title?: string;
+  description?: string;
+  coverUrl?: string;
+  type?: string;
+  year?: number;
+  status?: string;
+  score?: number;
+  scoredBy?: number;
+  tags: string[];
+  altTitles: string[];
+};
+
+type AnilistMedia = {
+  id?: number;
+  idMal?: number;
+  title?: { romaji?: string; english?: string; native?: string };
+  synonyms?: string[];
+  description?: string;
+  coverImage?: { extraLarge?: string; large?: string };
+  genres?: string[];
+  status?: string;
+  format?: string;
+  startDate?: { year?: number };
+};
+
+type JikanManga = {
+  mal_id?: number;
+  url?: string;
+  title?: string;
+  title_english?: string;
+  title_japanese?: string;
+  titles?: Array<{ title?: string }>;
+  synopsis?: string;
+  score?: number;
+  scored_by?: number;
+  status?: string;
+  type?: string;
+  images?: {
+    webp?: { large_image_url?: string; image_url?: string };
+    jpg?: { large_image_url?: string; image_url?: string };
+  };
+  published?: { prop?: { from?: { year?: number } } };
+  genres?: Array<{ name?: string }>;
+  themes?: Array<{ name?: string }>;
+  demographics?: Array<{ name?: string }>;
+};
+
+function stripHtml(value?: string) {
+  return value
+    ?.replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#039;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+function numericIdFromLink(value?: string) {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return trimmed;
+  const match = trimmed.match(/\/(?:manga|anime)\/(\d+)/i) ?? trimmed.match(/myanimelist\.net\/manga\/(\d+)/i);
+  return match?.[1];
+}
+
+function linkedId(links: Record<string, string> | undefined, keys: string[]) {
+  for (const key of keys) {
+    const id = numericIdFromLink(links?.[key]);
+    if (id) return id;
+  }
+  return undefined;
+}
+
+async function externalJson<T>(url: string, init?: RequestInit, attempt = 0): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), externalMetadataTimeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "ScottShelf/0.1",
+        ...(init?.headers ?? {})
+      }
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      if ((response.status === 429 || response.status >= 500) && attempt < 3) {
+        await delay(1000 * (attempt + 1));
+        return externalJson<T>(url, init, attempt + 1);
+      }
+      throw new Error(`External metadata request failed (${response.status}): ${text.slice(0, 200)}`);
+    }
+    return text ? (JSON.parse(text) as T) : ({} as T);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchAnilistById(id: string) {
+  const body = JSON.stringify({
+    query: `
+      query ($id: Int) {
+        Media(id: $id, type: MANGA) {
+          id
+          idMal
+          title { romaji english native }
+          synonyms
+          description(asHtml: false)
+          coverImage { extraLarge large }
+          genres
+          status
+          format
+          startDate { year }
+        }
+      }
+    `,
+    variables: { id: Number(id) }
+  });
+  const result = await externalJson<{ data?: { Media?: AnilistMedia } }>("https://graphql.anilist.co", { method: "POST", body });
+  return result.data?.Media;
+}
+
+async function searchAnilist(base: MangaDetail) {
+  const body = JSON.stringify({
+    query: `
+      query ($search: String) {
+        Page(page: 1, perPage: 5) {
+          media(search: $search, type: MANGA) {
+            id
+            idMal
+            title { romaji english native }
+            synonyms
+            description(asHtml: false)
+            coverImage { extraLarge large }
+            genres
+            status
+            format
+            startDate { year }
+          }
+        }
+      }
+    `,
+    variables: { search: base.title }
+  });
+  const result = await externalJson<{ data?: { Page?: { media?: AnilistMedia[] } } }>("https://graphql.anilist.co", { method: "POST", body });
+  const candidates = result.data?.Page?.media ?? [];
+  let best: { media: AnilistMedia; score: number } | undefined;
+  for (const media of candidates) {
+    const titles = [media.title?.english, media.title?.romaji, media.title?.native, ...(media.synonyms ?? [])].filter(
+      (title): title is string => Boolean(title)
+    );
+    const score = Math.max(...titles.map((title) => titleSimilarity(base.title, title)));
+    if (!best || score > best.score) best = { media, score };
+  }
+  return best && best.score >= 0.72 ? best.media : undefined;
+}
+
+async function fetchJikanById(id: string) {
+  const result = await externalJson<{ data?: JikanManga }>(`https://api.jikan.moe/v4/manga/${encodeURIComponent(id)}`);
+  return result.data;
+}
+
+async function searchJikan(base: MangaDetail) {
+  const result = await externalJson<{ data?: JikanManga[] }>(
+    `https://api.jikan.moe/v4/manga?q=${encodeURIComponent(base.title)}&limit=5`
+  );
+  const candidates = result.data ?? [];
+  let best: { manga: JikanManga; score: number } | undefined;
+  for (const manga of candidates) {
+    const titles = [manga.title_english, manga.title, manga.title_japanese, ...(manga.titles ?? []).map((item) => item.title)].filter(
+      (title): title is string => Boolean(title)
+    );
+    const score = Math.max(...titles.map((title) => titleSimilarity(base.title, title)));
+    if (!best || score > best.score) best = { manga, score };
+  }
+  return best && best.score >= 0.72 ? best.manga : undefined;
+}
+
+async function fetchExternalMetadata(base: MangaDetail): Promise<ExternalMetadata | undefined> {
+  const anilistId = linkedId(base.links, ["al", "anilist"]);
+  const linkedMalId = linkedId(base.links, ["mal", "myanimelist"]);
+  const anilist = anilistId ? await fetchAnilistById(anilistId).catch(() => undefined) : await searchAnilist(base).catch(() => undefined);
+  const malId = linkedMalId || (anilist?.idMal ? String(anilist.idMal) : undefined);
+  const jikan = malId ? await fetchJikanById(malId).catch(() => undefined) : await searchJikan(base).catch(() => undefined);
+
+  if (!anilist && !jikan) return undefined;
+
+  const nextAnilistId = anilist?.id ? String(anilist.id) : anilistId;
+  const nextMalId = jikan?.mal_id ? String(jikan.mal_id) : malId;
+  const tags = uniqueStrings([
+    ...(jikan?.genres ?? []).map((item) => item.name),
+    ...(jikan?.themes ?? []).map((item) => item.name),
+    ...(jikan?.demographics ?? []).map((item) => item.name),
+    ...(anilist?.genres ?? [])
+  ]);
+  const altTitles = uniqueStrings([
+    jikan?.title_english,
+    jikan?.title,
+    jikan?.title_japanese,
+    ...(jikan?.titles ?? []).map((item) => item.title),
+    anilist?.title?.english,
+    anilist?.title?.romaji,
+    anilist?.title?.native,
+    ...(anilist?.synonyms ?? [])
+  ]);
+
+  return {
+    anilistId: nextAnilistId,
+    myAnimeListId: nextMalId,
+    anilistUrl: nextAnilistId ? `https://anilist.co/manga/${nextAnilistId}` : undefined,
+    myAnimeListUrl: jikan?.url || (nextMalId ? `https://myanimelist.net/manga/${nextMalId}` : undefined),
+    title: jikan?.title_english || jikan?.title || anilist?.title?.english || anilist?.title?.romaji,
+    description: cleanSynopsis(jikan?.synopsis || stripHtml(anilist?.description)),
+    coverUrl:
+      jikan?.images?.webp?.large_image_url ||
+      jikan?.images?.jpg?.large_image_url ||
+      jikan?.images?.webp?.image_url ||
+      jikan?.images?.jpg?.image_url ||
+      anilist?.coverImage?.extraLarge ||
+      anilist?.coverImage?.large,
+    type: jikan?.type || anilist?.format,
+    year: jikan?.published?.prop?.from?.year || anilist?.startDate?.year,
+    status: jikan?.status || anilist?.status,
+    score: numberOrUndefined(jikan?.score),
+    scoredBy: numberOrUndefined(jikan?.scored_by),
+    tags,
+    altTitles
+  };
+}
+
+function metadataAsDetail(metadata: StoredMetadata): MangaDetail {
+  return {
+    source: "metadata",
+    id: metadata.mangaUpdatesId,
+    title: metadata.title,
+    description: metadata.description,
+    coverUrl: metadata.coverUrl,
+    status: metadata.status,
+    contentRating: metadata.contentRating,
+    demographic: metadata.type,
+    year: metadata.year,
+    latestChapter: metadata.latestChapter,
+    communityRating: metadata.communityRating,
+    ratingVotes: metadata.ratingVotes,
+    metadataUpdatedAt: metadata.metadataUpdatedAt,
+    metadataSource: metadataSourceLabel(metadata),
+    tags: metadata.tags,
+    genres: metadata.tags,
+    categories: metadata.categories,
+    altTitles: metadata.altTitles,
+    links: {
+      ...(metadata.url ? { mu: metadata.url } : {}),
+      ...(metadata.anilistUrl ? { al: metadata.anilistUrl } : {}),
+      ...(metadata.myAnimeListUrl ? { mal: metadata.myAnimeListUrl } : {})
+    },
+    authors: metadata.authors,
+    artists: metadata.artists,
+    publishers: metadata.publishers,
+    ratingDistribution: metadata.ratingDistribution
+  };
+}
+
+function applyExternalMetadata(metadata: StoredMetadata, external?: ExternalMetadata) {
+  if (!external) return metadata;
+  const next = { ...metadata };
+  next.anilistId = external.anilistId || next.anilistId;
+  next.myAnimeListId = external.myAnimeListId || next.myAnimeListId;
+  next.anilistUrl = external.anilistUrl || next.anilistUrl;
+  next.myAnimeListUrl = external.myAnimeListUrl || next.myAnimeListUrl;
+  next.description = next.description || external.description;
+  next.coverUrl = external.coverUrl || next.coverUrl;
+  next.type = next.type || external.type;
+  next.year = next.year || external.year;
+  next.status = next.status || external.status;
+  if (external.score !== undefined && external.scoredBy !== undefined && external.scoredBy > 0) {
+    next.communityRating = external.score;
+    next.ratingVotes = external.scoredBy;
+  }
+  next.tags = uniqueStrings([...next.tags, ...external.tags]);
+  next.altTitles = uniqueStrings([...next.altTitles, ...external.altTitles]).filter((title) => title !== next.title);
+  next.metadataUpdatedAt = new Date().toISOString();
+  return next;
+}
+
+function metadataSourceLabel(metadata: StoredMetadata) {
+  const sources = ["MangaUpdates"];
+  if (metadata.myAnimeListId || metadata.myAnimeListUrl) sources.push("MyAnimeList");
+  if (metadata.anilistId || metadata.anilistUrl) sources.push("AniList");
+  return sources.join(" + ");
+}
+
 function inferContentRating(tags: string[]) {
   const normalizedTags = tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean);
   const adultTags = new Set(["adult", "hentai", "smut", "erotica", "pornographic", "nsfw"]);
@@ -434,8 +764,12 @@ function metadataFromSeries(series: MangaUpdatesSeries, ratingDistribution?: Rat
 function metadataFromRow(row: MetadataRow): StoredMetadata {
   return {
     mangaUpdatesId: String(row.manga_updates_id),
+    anilistId: row.anilist_id === null || row.anilist_id === undefined ? undefined : String(row.anilist_id),
+    myAnimeListId: row.myanimelist_id === null || row.myanimelist_id === undefined ? undefined : String(row.myanimelist_id),
     title: row.title,
     url: row.url || undefined,
+    anilistUrl: row.anilist_url || undefined,
+    myAnimeListUrl: row.myanimelist_url || undefined,
     description: cleanSynopsis(row.description || undefined),
     coverUrl: row.cover_url || undefined,
     type: row.type || undefined,
@@ -534,7 +868,15 @@ async function fetchBestMetadata(base: MangaDetail) {
   const full = await retrieveSeries(best.series.series_id).catch(() => best?.series);
   if (!full?.series_id) return undefined;
   const distribution = await retrieveRatingDistribution(full.series_id);
-  return metadataFromSeries(full, distribution);
+  const metadata = metadataFromSeries(full, distribution);
+  const external = await fetchExternalMetadata({
+    ...base,
+    links: {
+      ...base.links,
+      ...(metadata.url ? { mu: metadata.url } : {})
+    }
+  }).catch(() => undefined);
+  return applyExternalMetadata(metadata, external);
 }
 
 async function findLinkedMetadata(db: Pool, source: string, mangaId: string) {
@@ -610,14 +952,18 @@ async function saveMetadata(
   await db.execute(
     `
       INSERT INTO title_metadata (
-        manga_updates_id, title, url, description, cover_url, type, year, status, content_rating, latest_chapter,
+        manga_updates_id, anilist_id, myanimelist_id, title, url, anilist_url, myanimelist_url, description, cover_url, type, year, status, content_rating, latest_chapter,
         community_rating, rating_votes, average_rating, genres_json, categories_json, alt_titles_json, authors_json,
         artists_json, publishers_json, rating_distribution_json, metadata_updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))
       ON DUPLICATE KEY UPDATE
+        anilist_id = VALUES(anilist_id),
+        myanimelist_id = VALUES(myanimelist_id),
         title = VALUES(title),
         url = VALUES(url),
+        anilist_url = VALUES(anilist_url),
+        myanimelist_url = VALUES(myanimelist_url),
         description = VALUES(description),
         cover_url = VALUES(cover_url),
         type = VALUES(type),
@@ -639,8 +985,12 @@ async function saveMetadata(
     `,
     [
       metadata.mangaUpdatesId,
+      metadata.anilistId ?? null,
+      metadata.myAnimeListId ?? null,
       metadata.title,
       metadata.url ?? null,
+      metadata.anilistUrl ?? null,
+      metadata.myAnimeListUrl ?? null,
       metadata.description ?? null,
       metadata.coverUrl ?? null,
       metadata.type ?? null,
@@ -728,7 +1078,9 @@ function mergeMetadata(base: MangaDetail, metadata: StoredMetadata): MangaDetail
     altTitles: uniqueStrings([...metadata.altTitles, ...base.altTitles]).filter((title) => title !== metadata.title),
     links: {
       ...base.links,
-      ...(metadata.url ? { mu: metadata.url } : {})
+      ...(metadata.url ? { mu: metadata.url } : {}),
+      ...(metadata.anilistUrl ? { al: metadata.anilistUrl } : {}),
+      ...(metadata.myAnimeListUrl ? { mal: metadata.myAnimeListUrl } : {})
     },
     artists: uniqueStrings([...(metadata.artists ?? []), ...(base.artists ?? [])]),
     authors: uniqueStrings([...(metadata.authors ?? []), ...(base.authors ?? [])]),
@@ -736,7 +1088,7 @@ function mergeMetadata(base: MangaDetail, metadata: StoredMetadata): MangaDetail
     communityRating: metadata.communityRating,
     ratingVotes: metadata.ratingVotes,
     ratingDistribution: metadata.ratingDistribution,
-    metadataSource: "MangaUpdates",
+    metadataSource: metadataSourceLabel(metadata),
     metadataUpdatedAt: metadata.metadataUpdatedAt
   };
 }
@@ -759,13 +1111,17 @@ function detailFromStoredMetadata(source: string, mangaId: string, metadata: Sto
     latestChapter: metadata.latestChapter,
     communityRating: metadata.communityRating,
     ratingVotes: metadata.ratingVotes,
-    metadataSource: "MangaUpdates",
+    metadataSource: metadataSourceLabel(metadata),
     metadataUpdatedAt: metadata.metadataUpdatedAt,
     genres,
     categories,
     tags,
     altTitles: metadata.altTitles,
-    links: metadata.url ? { mu: metadata.url } : {},
+    links: {
+      ...(metadata.url ? { mu: metadata.url } : {}),
+      ...(metadata.anilistUrl ? { al: metadata.anilistUrl } : {}),
+      ...(metadata.myAnimeListUrl ? { mal: metadata.myAnimeListUrl } : {})
+    },
     artists: metadata.artists,
     authors: metadata.authors,
     publishers: metadata.publishers,
@@ -1140,8 +1496,12 @@ export async function initializeMetadataTables() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS title_metadata (
       manga_updates_id BIGINT UNSIGNED PRIMARY KEY,
+      anilist_id BIGINT UNSIGNED NULL,
+      myanimelist_id BIGINT UNSIGNED NULL,
       title VARCHAR(512) NOT NULL,
       url TEXT NULL,
+      anilist_url TEXT NULL,
+      myanimelist_url TEXT NULL,
       description MEDIUMTEXT NULL,
       cover_url TEXT NULL,
       type VARCHAR(64) NULL,
@@ -1166,6 +1526,11 @@ export async function initializeMetadataTables() {
       FULLTEXT INDEX title_metadata_title_ft (title)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+  await ensureColumn(db, "title_metadata", "anilist_id", "BIGINT UNSIGNED NULL", "manga_updates_id");
+  await ensureColumn(db, "title_metadata", "myanimelist_id", "BIGINT UNSIGNED NULL", "anilist_id");
+  await ensureColumn(db, "title_metadata", "anilist_url", "TEXT NULL", "url");
+  await ensureColumn(db, "title_metadata", "myanimelist_url", "TEXT NULL", "anilist_url");
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS title_metadata_links (
@@ -1402,13 +1767,82 @@ export async function enrichMangaMetadata(base: MangaDetail): Promise<MangaDetai
   return mergeMetadata(base, metadata);
 }
 
-async function refreshMetadataById(mangaUpdatesId: string | number) {
+export async function refreshMetadataById(mangaUpdatesId: string | number) {
+  const db = await getDatabasePool();
   const series = await retrieveSeries(mangaUpdatesId);
   const distribution = await retrieveRatingDistribution(mangaUpdatesId);
-  const metadata = metadataFromSeries(series, distribution);
-  const db = await getDatabasePool();
+  const baseMetadata = metadataFromSeries(series, distribution);
+  const linkedDetail = await findCompiledDetailForMetadata(db, baseMetadata.mangaUpdatesId);
+  const external = await fetchExternalMetadata(linkedDetail ?? metadataAsDetail(baseMetadata)).catch(() => undefined);
+  const metadata = applyExternalMetadata(baseMetadata, external);
   await saveMetadata(db, metadata);
   await refreshCompiledRowsForMetadata(db, metadata);
+}
+
+async function findCompiledDetailForMetadata(db: Pool, mangaUpdatesId: string | number) {
+  const [rows] = await db.execute<RowDataPacket[]>(
+    `
+      SELECT compiled_title_cache.detail_json
+      FROM compiled_title_cache
+      JOIN title_metadata_links
+        ON title_metadata_links.source = compiled_title_cache.source
+        AND title_metadata_links.manga_id = compiled_title_cache.manga_id
+      WHERE title_metadata_links.manga_updates_id = ?
+      ORDER BY
+        CASE
+          WHEN JSON_EXTRACT(compiled_title_cache.detail_json, '$.links.mal') IS NOT NULL THEN 0
+          WHEN JSON_EXTRACT(compiled_title_cache.detail_json, '$.links.al') IS NOT NULL THEN 1
+          ELSE 2
+        END,
+        compiled_title_cache.updated_at DESC
+      LIMIT 1
+    `,
+    [mangaUpdatesId]
+  );
+  for (const row of rows) {
+    const detail = parseCompiledDetail(row.detail_json as string | MangaDetail);
+    if (detail) return detail;
+  }
+  return undefined;
+}
+
+export async function refreshAllStoredMetadata(options: { concurrency?: number; limit?: number } = {}) {
+  const db = await getDatabasePool();
+  const limit = Math.max(0, Math.floor(options.limit ?? 0));
+  const concurrency = Math.max(1, Math.min(Math.floor(options.concurrency ?? 2), 4));
+  const [rows] = await db.query<RowDataPacket[]>(
+    `
+      SELECT manga_updates_id
+      FROM title_metadata
+      ORDER BY metadata_updated_at ASC
+      ${limit ? `LIMIT ${limit}` : ""}
+    `
+  );
+  const ids = rows.map((row) => String(row.manga_updates_id)).filter(Boolean);
+  let index = 0;
+  let refreshed = 0;
+  let failed = 0;
+
+  async function worker(workerId: number) {
+    while (index < ids.length) {
+      const id = ids[index];
+      index += 1;
+      try {
+        await refreshMetadataById(id);
+        refreshed += 1;
+        console.log(`[metadata-backfill:${workerId}] refreshed ${id} (${refreshed}/${ids.length})`);
+      } catch (error) {
+        failed += 1;
+        console.warn(
+          `[metadata-backfill:${workerId}] failed ${id}:`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(ids.length, 1)) }, (_item, workerId) => worker(workerId)));
+  return { total: ids.length, refreshed, failed };
 }
 
 async function refreshCompiledRowsForMetadata(db: Pool, metadata: StoredMetadata) {

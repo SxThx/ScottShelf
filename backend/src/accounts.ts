@@ -1,6 +1,18 @@
 import crypto from "node:crypto";
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
-import type { ChapterPages, ChapterSummary } from "./sources/types";
+import type { ChapterPages, ChapterSummary, CommentPage } from "./sources/types";
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function isMysqlTransientLockError(error: unknown) {
+  const mysqlError = error as { code?: string; errno?: number } | undefined;
+  return (
+    mysqlError?.code === "ER_LOCK_DEADLOCK" ||
+    mysqlError?.code === "ER_LOCK_WAIT_TIMEOUT" ||
+    mysqlError?.errno === 1213 ||
+    mysqlError?.errno === 1205
+  );
+}
 
 export type UserRole = "admin" | "user";
 
@@ -63,7 +75,14 @@ export interface BookmarkUpdateRecord {
   error?: string;
 }
 
-export type BookmarkDownloadJobType = "title_detail" | "latest_check" | "chapter_list" | "latest_chapters" | "chapter_pages";
+export type BookmarkDownloadJobType =
+  | "title_detail"
+  | "latest_check"
+  | "chapter_list"
+  | "latest_chapters"
+  | "chapter_pages"
+  | "title_comments"
+  | "chapter_comments";
 
 export interface BookmarkDownloadJobRecord {
   id: string;
@@ -96,9 +115,38 @@ export interface AdminDashboardStats {
     chapterPageRows: number;
     chapterPageImages: number;
   }>;
+  userBookmarks: Array<{
+    userId: string;
+    username: string;
+    bookmarks: number;
+  }>;
+  userActivity: Array<{
+    userId: string;
+    username: string;
+    lastActiveAt?: string;
+    lastReadTitle?: string;
+    lastReadChapter?: string;
+    lastReadSource?: string;
+    lastReadMangaId?: string;
+  }>;
   jobStatus: Array<{ status: string; count: number }>;
   jobTypes: Array<{ jobType: string; pending: number; running: number; done: number; failed: number; total: number }>;
+  jobActivity: {
+    latestCheckLastCompletedAt?: string;
+    latestCheckNextQueuedAt?: string;
+    latestChaptersLastCompletedAt?: string;
+    workerLastCompletedAt?: string;
+  };
   recentActivity: Array<{ label: string; value?: string }>;
+  refreshSchedules?: Array<{
+    key: string;
+    label: string;
+    status: string;
+    lastRefreshedAt?: string;
+    nextRefreshAt?: string;
+    intervalMs?: number;
+    detail?: string;
+  }>;
 }
 
 export interface TitleCacheStatus {
@@ -174,6 +222,7 @@ interface FavoriteRow extends RowDataPacket {
   manga_id: string;
   canonical_key: string | null;
   effective_canonical_key?: string | null;
+  effective_cover_url?: string | null;
   title: string;
   description: string | null;
   cover_url: string | null;
@@ -272,6 +321,26 @@ interface ChapterPageCacheRow extends RowDataPacket {
   chapter_number: string | null;
   language: string;
   pages_json: string;
+  checked_at: Date | string;
+  error: string | null;
+}
+
+interface CommentCacheRow extends RowDataPacket {
+  source: string;
+  target_type: "title" | "chapter";
+  manga_id: string;
+  chapter_number: string | null;
+  volume: string | null;
+  thread_key: string;
+  thread_id: string;
+  page_url: string | null;
+  page_title: string | null;
+  comment_count: number | null;
+  main_comment_count: number | null;
+  is_closed: number | boolean | null;
+  sort_order: string;
+  comments_json: string;
+  cursor_token: string | null;
   checked_at: Date | string;
   error: string | null;
 }
@@ -382,6 +451,23 @@ function chapterNumberValue(value?: string) {
   return Number.isFinite(number) ? number : undefined;
 }
 
+function chapterNumberFromStoredId(chapterId?: string | null) {
+  const trimmed = chapterId?.trim();
+  if (!trimmed) return undefined;
+
+  const compositeChapter = trimmed.match(/~([^~]+)$/)?.[1];
+  if (compositeChapter && chapterNumberValue(compositeChapter) !== undefined) return compositeChapter;
+
+  const numeric = chapterNumberValue(trimmed);
+  if (numeric !== undefined && numeric < 10000 && /^\d+(?:\.\d+)?$/.test(trimmed)) return trimmed;
+
+  return undefined;
+}
+
+function readableChapterNumber(chapterNumber?: string | null, chapterId?: string | null) {
+  return chapterNumber || chapterNumberFromStoredId(chapterId);
+}
+
 function chapterTimestamp(value?: Date | string | null) {
   if (!value) return 0;
   const timestamp = new Date(value).getTime();
@@ -469,7 +555,7 @@ function favoriteRecord(row: FavoriteRow): FavoriteRecord {
     canonicalKey: row.effective_canonical_key || row.canonical_key || undefined,
     title: row.title,
     description: row.description || undefined,
-    coverUrl: row.cover_url || undefined,
+    coverUrl: row.effective_cover_url || row.cover_url || undefined,
     status: row.status || undefined,
     contentRating: row.content_rating || undefined,
     demographic: row.demographic || undefined,
@@ -482,7 +568,7 @@ function favoriteRecord(row: FavoriteRow): FavoriteRecord {
     tags: parseTags(row.tags_json),
     addedAt: toIsoDate(row.added_at),
     lastReadChapterId: row.last_read_chapter_id || undefined,
-    lastReadChapter: row.last_read_chapter_number || undefined,
+    lastReadChapter: readableChapterNumber(row.last_read_chapter_number, row.last_read_chapter_id),
     lastReadScrollPosition: row.last_read_scroll_position ?? undefined
   };
 }
@@ -494,7 +580,7 @@ function readingProgressRecord(row: ReadingProgressRow): ReadingProgressRecord {
     canonicalKey: row.effective_canonical_key || row.canonical_key || undefined,
     chapterSource: row.chapter_source || row.source,
     chapterId: row.chapter_id,
-    chapterNumber: row.chapter_number || undefined,
+    chapterNumber: readableChapterNumber(row.chapter_number, row.chapter_id),
     scrollPosition: row.scroll_position ?? undefined,
     updatedAt: toIsoDate(row.updated_at)
   };
@@ -763,6 +849,31 @@ export async function initializeAccounts() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await nextPool.query(`
+    CREATE TABLE IF NOT EXISTS comment_cache (
+      source VARCHAR(64) NOT NULL,
+      target_type VARCHAR(32) NOT NULL,
+      manga_id VARCHAR(255) NOT NULL,
+      chapter_number VARCHAR(64) NULL,
+      volume VARCHAR(64) NULL,
+      thread_key VARCHAR(255) NOT NULL,
+      thread_id VARCHAR(64) NOT NULL,
+      page_url TEXT NULL,
+      page_title VARCHAR(512) NULL,
+      comment_count INT UNSIGNED NULL,
+      main_comment_count INT UNSIGNED NULL,
+      is_closed BOOLEAN NULL,
+      sort_order VARCHAR(32) NOT NULL DEFAULT 'best',
+      comments_json JSON NOT NULL,
+      cursor_token VARCHAR(255) NULL,
+      checked_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      error TEXT NULL,
+      PRIMARY KEY (source, target_type, thread_key),
+      INDEX comment_cache_manga_idx (source, manga_id, target_type),
+      INDEX comment_cache_chapter_idx (source, manga_id, chapter_number, volume),
+      INDEX comment_cache_checked_idx (checked_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await nextPool.query(`
     CREATE TABLE IF NOT EXISTS bookmark_download_jobs (
       id CHAR(36) PRIMARY KEY,
       dedupe_key VARCHAR(768) NOT NULL,
@@ -890,6 +1001,7 @@ export async function databaseStatus() {
     .query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM bookmark_update_cache")
     .catch(() => [[]]);
   const [chapterPageCache] = await db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM chapter_page_cache").catch(() => [[]]);
+  const [commentCache] = await db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM comment_cache").catch(() => [[]]);
   const [bookmarkDownloadJobs] = await db
     .query<RowDataPacket[]>("SELECT status, COUNT(*) AS count FROM bookmark_download_jobs GROUP BY status")
     .catch(() => [[]]);
@@ -908,6 +1020,7 @@ export async function databaseStatus() {
       compiledTitleCache: Number(compiledTitleCache[0]?.count ?? 0),
       bookmarkUpdateCache: Number(bookmarkUpdateCache[0]?.count ?? 0),
       chapterPageCache: Number(chapterPageCache[0]?.count ?? 0),
+      commentCache: Number(commentCache[0]?.count ?? 0),
       bookmarkDownloadJobs: Object.fromEntries(bookmarkDownloadJobs.map((row) => [String(row.status), Number(row.count ?? 0)]))
     }
   };
@@ -961,7 +1074,15 @@ export async function adminDashboardStats(): Promise<AdminDashboardStats> {
     recentTitleDetail,
     recentChapterList,
     recentChapterPages,
-    recentBookmarkUpdate
+    recentBookmarkUpdate,
+    recentCommentCache,
+    recentMangaUpdatesMetadata,
+    recentLatestCheck,
+    nextLatestCheck,
+    recentLatestChapters,
+    recentWorkerJob,
+    userBookmarks,
+    userActivity
   ] = await Promise.all([
     db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM users"),
     db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM favorites"),
@@ -1013,7 +1134,77 @@ export async function adminDashboardStats(): Promise<AdminDashboardStats> {
     db.query<RowDataPacket[]>("SELECT MAX(updated_at) AS value FROM compiled_title_cache").catch(() => [[] as RowDataPacket[]]),
     db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM chapter_list_cache").catch(() => [[] as RowDataPacket[]]),
     db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM chapter_page_cache").catch(() => [[] as RowDataPacket[]]),
-    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM bookmark_update_cache").catch(() => [[] as RowDataPacket[]])
+    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM bookmark_update_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(checked_at) AS value FROM comment_cache").catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(metadata_updated_at) AS value FROM title_metadata").catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>("SELECT MAX(updated_at) AS value FROM bookmark_download_jobs WHERE job_type = 'latest_check' AND status = 'done'")
+      .catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>("SELECT MIN(run_after) AS value FROM bookmark_download_jobs WHERE job_type = 'latest_check' AND status = 'pending'")
+      .catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>("SELECT MAX(updated_at) AS value FROM bookmark_download_jobs WHERE job_type = 'latest_chapters' AND status = 'done'")
+      .catch(() => [[] as RowDataPacket[]]),
+    db.query<RowDataPacket[]>("SELECT MAX(updated_at) AS value FROM bookmark_download_jobs WHERE status = 'done'").catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>(
+        `
+          SELECT users.id AS userId, users.username, COUNT(favorites.manga_id) AS bookmarks
+          FROM users
+          LEFT JOIN favorites ON favorites.user_id = users.id
+          GROUP BY users.id, users.username
+          ORDER BY bookmarks DESC, users.username ASC
+        `
+      )
+      .catch(() => [[] as RowDataPacket[]]),
+    db
+      .query<RowDataPacket[]>(
+        `
+          SELECT
+            users.id AS userId,
+            users.username,
+            COALESCE(latest_progress.updated_at, latest_favorite.added_at, users.updated_at) AS lastActiveAt,
+            COALESCE(
+              JSON_UNQUOTE(JSON_EXTRACT(compiled_title_cache.detail_json, '$.title')),
+              favorites.title,
+              title_sources.title,
+              latest_progress.manga_id
+            ) AS lastReadTitle,
+            latest_progress.chapter_number AS lastReadChapter,
+            latest_progress.chapter_id AS lastReadChapterId,
+            latest_progress.source AS lastReadSource,
+            latest_progress.manga_id AS lastReadMangaId
+          FROM users
+          LEFT JOIN (
+            SELECT ranked.*
+            FROM (
+              SELECT
+                reading_progress.*,
+                ROW_NUMBER() OVER (PARTITION BY reading_progress.user_id ORDER BY reading_progress.updated_at DESC) AS rn
+              FROM reading_progress
+            ) ranked
+            WHERE ranked.rn = 1
+          ) latest_progress ON latest_progress.user_id = users.id
+          LEFT JOIN (
+            SELECT user_id, MAX(added_at) AS added_at
+            FROM favorites
+            GROUP BY user_id
+          ) latest_favorite ON latest_favorite.user_id = users.id
+          LEFT JOIN favorites
+            ON favorites.user_id = users.id
+            AND favorites.source = latest_progress.source
+            AND favorites.manga_id = latest_progress.manga_id
+          LEFT JOIN title_sources
+            ON title_sources.source = latest_progress.source
+            AND title_sources.manga_id = latest_progress.manga_id
+          LEFT JOIN compiled_title_cache
+            ON compiled_title_cache.source = latest_progress.source
+            AND compiled_title_cache.manga_id = latest_progress.manga_id
+          ORDER BY lastActiveAt DESC, users.username ASC
+        `
+      )
+      .catch(() => [[] as RowDataPacket[]])
   ]);
 
   const sourceMap = new Map<string, AdminDashboardStats["sourceBreakdown"][number]>();
@@ -1055,6 +1246,20 @@ export async function adminDashboardStats(): Promise<AdminDashboardStats> {
       chapterPageImages: rowNumber(chapterPageImages[0][0])
     },
     sourceBreakdown: [...sourceMap.values()].sort((left, right) => right.chapterPageRows + right.chapterLists - (left.chapterPageRows + left.chapterLists)),
+    userBookmarks: userBookmarks[0].map((row) => ({
+      userId: String(row.userId),
+      username: String(row.username),
+      bookmarks: Number(row.bookmarks ?? 0)
+    })),
+    userActivity: userActivity[0].map((row) => ({
+      userId: String(row.userId),
+      username: String(row.username),
+      lastActiveAt: optionalIsoDate(row.lastActiveAt ?? null),
+      lastReadTitle: row.lastReadTitle ? String(row.lastReadTitle) : undefined,
+      lastReadChapter: readableChapterNumber(row.lastReadChapter, row.lastReadChapterId),
+      lastReadSource: row.lastReadSource ? String(row.lastReadSource) : undefined,
+      lastReadMangaId: row.lastReadMangaId ? String(row.lastReadMangaId) : undefined
+    })),
     jobStatus: jobStatus[0].map((row) => ({ status: String(row.status), count: Number(row.count ?? 0) })),
     jobTypes: jobTypes[0].map((row) => ({
       jobType: String(row.job_type),
@@ -1064,11 +1269,19 @@ export async function adminDashboardStats(): Promise<AdminDashboardStats> {
       failed: Number(row.failed ?? 0),
       total: Number(row.total ?? 0)
     })),
+    jobActivity: {
+      latestCheckLastCompletedAt: optionalIsoDate(recentLatestCheck[0][0]?.value ?? null),
+      latestCheckNextQueuedAt: optionalIsoDate(nextLatestCheck[0][0]?.value ?? null),
+      latestChaptersLastCompletedAt: optionalIsoDate(recentLatestChapters[0][0]?.value ?? null),
+      workerLastCompletedAt: optionalIsoDate(recentWorkerJob[0][0]?.value ?? null)
+    },
     recentActivity: [
       { label: "Title detail cache", value: optionalIsoDate(recentTitleDetail[0][0]?.value ?? null) },
       { label: "Chapter list cache", value: optionalIsoDate(recentChapterList[0][0]?.value ?? null) },
       { label: "Chapter page cache", value: optionalIsoDate(recentChapterPages[0][0]?.value ?? null) },
-      { label: "Bookmark update cache", value: optionalIsoDate(recentBookmarkUpdate[0][0]?.value ?? null) }
+      { label: "Bookmark update cache", value: optionalIsoDate(recentBookmarkUpdate[0][0]?.value ?? null) },
+      { label: "Comix comments", value: optionalIsoDate(recentCommentCache[0][0]?.value ?? null) },
+      { label: "MangaUpdates metadata", value: optionalIsoDate(recentMangaUpdatesMetadata[0][0]?.value ?? null) }
     ]
   };
 }
@@ -1341,6 +1554,11 @@ export async function listFavorites(userId: string) {
       SELECT
         favorites.*,
         COALESCE(favorites.canonical_key, CONCAT('mu:', title_metadata_links.manga_updates_id)) AS effective_canonical_key,
+        COALESCE(
+          favorites.cover_url,
+          title_sources.cover_url,
+          JSON_UNQUOTE(JSON_EXTRACT(compiled_title_cache.detail_json, '$.coverUrl'))
+        ) AS effective_cover_url,
         bookmark_update_cache.latest_chapter_number AS cached_latest_chapter_number,
         bookmark_update_cache.latest_chapter_published_at AS cached_latest_chapter_published_at,
         bookmark_update_cache.latest_chapter_readable_at AS cached_latest_chapter_readable_at,
@@ -1351,6 +1569,12 @@ export async function listFavorites(userId: string) {
       LEFT JOIN title_metadata_links
         ON title_metadata_links.source = favorites.source
         AND title_metadata_links.manga_id = favorites.manga_id
+      LEFT JOIN title_sources
+        ON title_sources.source = favorites.source
+        AND title_sources.manga_id = favorites.manga_id
+      LEFT JOIN compiled_title_cache
+        ON compiled_title_cache.source = favorites.source
+        AND compiled_title_cache.manga_id = favorites.manga_id
       LEFT JOIN bookmark_update_cache
         ON bookmark_update_cache.source = favorites.source
         AND bookmark_update_cache.manga_id = favorites.manga_id
@@ -1615,6 +1839,173 @@ export async function upsertChapterPageCache(input: {
   );
 }
 
+function parseJsonArray<T>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function countCommentItems(comments: Array<{ replies?: unknown[] }>) {
+  let total = 0;
+  for (const comment of comments) {
+    total += 1;
+    if (Array.isArray(comment.replies)) total += countCommentItems(comment.replies as Array<{ replies?: unknown[] }>);
+  }
+  return total;
+}
+
+export async function getCommentCache(source: string, targetType: "title" | "chapter", threadKey: string) {
+  const db = await getPool();
+  const [rows] = await db.execute<CommentCacheRow[]>(
+    `
+      SELECT *
+      FROM comment_cache
+      WHERE source = ? AND target_type = ? AND thread_key = ?
+      LIMIT 1
+    `,
+    [source, targetType, threadKey]
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    source: row.source,
+    targetType: row.target_type,
+    mangaId: row.manga_id,
+    chapterNumber: row.chapter_number || undefined,
+    volume: row.volume || undefined,
+    thread: {
+      id: row.thread_id,
+      key: row.thread_key,
+      pageUrl: row.page_url || undefined,
+      pageTitle: row.page_title || undefined,
+      commentCount: row.comment_count ?? undefined,
+      mainCommentCount: row.main_comment_count ?? undefined,
+      isClosed: row.is_closed === null ? undefined : Boolean(row.is_closed)
+    },
+    comments: parseJsonArray<CommentPage["comments"][number]>(row.comments_json),
+    sort: row.sort_order,
+    cursor: row.cursor_token || undefined,
+    checkedAt: toIsoDate(row.checked_at),
+    error: row.error || undefined
+  };
+}
+
+export async function getCommentCacheByTarget(input: {
+  source: string;
+  targetType: "title" | "chapter";
+  mangaId: string;
+  chapterNumber?: string;
+  volume?: string;
+}) {
+  const db = await getPool();
+  const [rows] = await db.execute<CommentCacheRow[]>(
+    `
+      SELECT *
+      FROM comment_cache
+      WHERE source = ?
+        AND target_type = ?
+        AND manga_id = ?
+        AND (? IS NULL OR chapter_number = ?)
+        AND (? IS NULL OR volume = ?)
+      ORDER BY checked_at DESC
+      LIMIT 1
+    `,
+    [
+      input.source,
+      input.targetType,
+      input.mangaId,
+      input.chapterNumber ?? null,
+      input.chapterNumber ?? null,
+      input.volume ?? null,
+      input.volume ?? null
+    ]
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    source: row.source,
+    targetType: row.target_type,
+    mangaId: row.manga_id,
+    chapterNumber: row.chapter_number || undefined,
+    volume: row.volume || undefined,
+    thread: {
+      id: row.thread_id,
+      key: row.thread_key,
+      pageUrl: row.page_url || undefined,
+      pageTitle: row.page_title || undefined,
+      commentCount: row.comment_count ?? undefined,
+      mainCommentCount: row.main_comment_count ?? undefined,
+      isClosed: row.is_closed === null ? undefined : Boolean(row.is_closed)
+    },
+    comments: parseJsonArray<CommentPage["comments"][number]>(row.comments_json),
+    sort: row.sort_order,
+    cursor: row.cursor_token || undefined,
+    checkedAt: toIsoDate(row.checked_at),
+    error: row.error || undefined
+  };
+}
+
+export async function upsertCommentCache(input: {
+  page: CommentPage;
+  error?: string;
+}) {
+  const db = await getPool();
+  const comments = input.page.comments ?? [];
+  const commentCount = countCommentItems(comments);
+  const mainCommentCount = comments.length;
+  await db.execute(
+    `
+      INSERT INTO comment_cache (
+        source, target_type, manga_id, chapter_number, volume, thread_key, thread_id,
+        page_url, page_title, comment_count, main_comment_count, is_closed, sort_order,
+        comments_json, cursor_token, checked_at, error
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?)
+      ON DUPLICATE KEY UPDATE
+        manga_id = VALUES(manga_id),
+        chapter_number = VALUES(chapter_number),
+        volume = VALUES(volume),
+        thread_id = VALUES(thread_id),
+        page_url = VALUES(page_url),
+        page_title = VALUES(page_title),
+        comment_count = VALUES(comment_count),
+        main_comment_count = VALUES(main_comment_count),
+        is_closed = VALUES(is_closed),
+        sort_order = VALUES(sort_order),
+        comments_json = CASE
+          WHEN VALUES(error) IS NULL THEN VALUES(comments_json)
+          ELSE comments_json
+        END,
+        cursor_token = VALUES(cursor_token),
+        checked_at = CURRENT_TIMESTAMP(3),
+        error = VALUES(error)
+    `,
+    [
+      input.page.source,
+      input.page.targetType,
+      input.page.mangaId,
+      input.page.chapterNumber ?? null,
+      input.page.volume ?? null,
+      input.page.thread.key,
+      input.page.thread.id,
+      input.page.thread.pageUrl ?? null,
+      input.page.thread.pageTitle ?? null,
+      commentCount,
+      mainCommentCount,
+      input.page.thread.isClosed ?? null,
+      input.page.sort,
+      JSON.stringify(comments),
+      input.page.cursor ?? null,
+      input.error?.slice(0, 2000) ?? null
+    ]
+  );
+}
+
 function bookmarkDownloadJobRecord(row: BookmarkDownloadJobRow): BookmarkDownloadJobRecord {
   return {
     id: row.id,
@@ -1664,7 +2055,7 @@ export async function enqueueBookmarkDownloadJob(input: {
         id, dedupe_key, job_type, source, manga_id, canonical_key, chapter_id, chapter_number, language,
         priority, max_attempts, status, run_after
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', COALESCE(?, CURRENT_TIMESTAMP(3)))
       ON DUPLICATE KEY UPDATE
         canonical_key = COALESCE(VALUES(canonical_key), canonical_key),
         chapter_number = COALESCE(VALUES(chapter_number), chapter_number),
@@ -1698,7 +2089,7 @@ export async function enqueueBookmarkDownloadJob(input: {
       input.language ?? "en",
       input.priority ?? 0,
       input.maxAttempts ?? 3,
-      input.runAfter ?? new Date(),
+      input.runAfter ?? null,
       refreshExisting ? 1 : 0,
       refreshExisting ? 1 : 0,
       refreshExisting ? 1 : 0
@@ -1713,6 +2104,7 @@ export async function enqueueBookmarkDownloadsForRef(
 ) {
   await enqueueBookmarkDownloadJob({ jobType: "title_detail", ...ref, priority, refreshExisting });
   await enqueueBookmarkDownloadJob({ jobType: "chapter_list", ...ref, priority, refreshExisting });
+  await enqueueBookmarkCommentDownloadsForRef(ref, Math.max(1, Math.floor(priority / 20)), refreshExisting);
   await enqueueMissingChapterPageDownloadJobsForSavedChapterList(
     { ...ref, language: "en" },
     Math.max(50, priority + 1)
@@ -1763,6 +2155,47 @@ export async function enqueueChapterPageDownloadJobsForChapters(
   return pageChapters.length;
 }
 
+function commentChapterJobId(chapterNumber: string, volume?: string) {
+  return `comments:${encodeURIComponent(chapterNumber)}:vol:${encodeURIComponent(volume || "0")}`;
+}
+
+export async function enqueueChapterCommentDownloadJobsForChapters(
+  ref: { source: string; mangaId: string; canonicalKey?: string; language?: string },
+  chapters: ChapterSummary[],
+  priority = 1,
+  refreshExisting = false
+) {
+  if (ref.source !== "comix") return 0;
+  const maxJobs = Number(process.env.BOOKMARK_COMMENT_MAX_CHAPTER_JOBS_PER_TITLE ?? 0);
+  const seen = new Set<string>();
+  const candidateChapters = chapters
+    .filter((chapter) => chapter.chapter)
+    .filter((chapter) => {
+      const key = `${chapter.chapter}:vol:${chapter.volume || "0"}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, maxJobs > 0 ? maxJobs : chapters.length);
+
+  for (const chapter of candidateChapters) {
+    await enqueueBookmarkDownloadJob({
+      jobType: "chapter_comments",
+      source: ref.source,
+      mangaId: ref.mangaId,
+      canonicalKey: ref.canonicalKey,
+      chapterId: commentChapterJobId(chapter.chapter as string, chapter.volume),
+      chapterNumber: chapter.chapter,
+      language: chapter.language || ref.language || "en",
+      priority,
+      maxAttempts: 2,
+      refreshExisting
+    });
+  }
+
+  return candidateChapters.length;
+}
+
 async function existingChapterPageKeys(chapters: ChapterSummary[]) {
   const db = await getPool();
   const keys = new Set<string>();
@@ -1798,21 +2231,62 @@ export async function enqueueMissingChapterPageDownloadJobsForSavedChapterList(
   return enqueueChapterPageDownloadJobsForChapters({ ...ref, language }, chapters, priority);
 }
 
-export async function claimBookmarkDownloadJobs(limit: number, workerId: string) {
+export async function enqueueBookmarkCommentDownloadsForRef(
+  ref: { source: string; mangaId: string; canonicalKey?: string },
+  priority = 1,
+  refreshExisting = false
+) {
+  if (ref.source !== "comix") return 0;
+  let queued = 0;
+  await enqueueBookmarkDownloadJob({
+    jobType: "title_comments",
+    ...ref,
+    priority,
+    maxAttempts: 2,
+    refreshExisting
+  });
+  queued += 1;
+  const persistent = await getChapterListCache(ref.source, ref.mangaId, "en").catch(() => undefined);
+  const chapters = persistent?.chapters ?? [];
+  if (chapters.length) {
+    queued += await enqueueChapterCommentDownloadJobsForChapters({ ...ref, language: "en" }, chapters, Math.max(1, priority - 4), refreshExisting);
+  }
+  return queued;
+}
+
+export async function claimBookmarkDownloadJobs(limit: number, workerId: string, jobTypes?: BookmarkDownloadJobType[]) {
+  const maxAttempts = 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await claimBookmarkDownloadJobsOnce(limit, workerId, jobTypes);
+    } catch (error) {
+      if (!isMysqlTransientLockError(error)) throw error;
+      if (attempt === maxAttempts - 1) return [];
+      await wait(25 + Math.floor(Math.random() * 125) + attempt * 75);
+    }
+  }
+  return [];
+}
+
+async function claimBookmarkDownloadJobsOnce(limit: number, workerId: string, jobTypes?: BookmarkDownloadJobType[]) {
   const db = await getPool();
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
     const safeLimit = Math.max(Math.min(Math.floor(limit), 25), 1);
+    const safeJobTypes = [...new Set(jobTypes ?? [])].filter(Boolean);
+    const jobTypeFilter = safeJobTypes.length ? `AND job_type IN (${safeJobTypes.map(() => "?").join(", ")})` : "";
     const [rows] = await connection.query<BookmarkDownloadJobRow[]>(
       `
         SELECT id, job_type, source, manga_id, canonical_key, chapter_id, chapter_number, language, priority, attempts + 1 AS attempts, max_attempts
         FROM bookmark_download_jobs
         WHERE status = 'pending' AND run_after <= CURRENT_TIMESTAMP(3) AND attempts < max_attempts
+          ${jobTypeFilter}
         ORDER BY priority DESC, created_at ASC
         LIMIT ${safeLimit}
         FOR UPDATE SKIP LOCKED
-      `
+      `,
+      safeJobTypes
     );
     if (rows.length) {
       await connection.query(
@@ -1987,14 +2461,14 @@ async function insertFavorite(db: Pool | PoolConnection, userId: string, favorit
       ON DUPLICATE KEY UPDATE
         canonical_key = COALESCE(VALUES(canonical_key), canonical_key),
         title = VALUES(title),
-        description = VALUES(description),
-        cover_url = VALUES(cover_url),
-        status = VALUES(status),
-        content_rating = VALUES(content_rating),
-        demographic = VALUES(demographic),
-        year = VALUES(year),
-        latest_chapter = VALUES(latest_chapter),
-        latest_chapter_released_at = VALUES(latest_chapter_released_at),
+        description = COALESCE(VALUES(description), description),
+        cover_url = COALESCE(VALUES(cover_url), cover_url),
+        status = COALESCE(VALUES(status), status),
+        content_rating = COALESCE(VALUES(content_rating), content_rating),
+        demographic = COALESCE(VALUES(demographic), demographic),
+        year = COALESCE(VALUES(year), year),
+        latest_chapter = COALESCE(VALUES(latest_chapter), latest_chapter),
+        latest_chapter_released_at = COALESCE(VALUES(latest_chapter_released_at), latest_chapter_released_at),
         tags_json = VALUES(tags_json)
     `,
     [
@@ -2063,12 +2537,10 @@ export async function listReadingProgress(userId: string) {
     if (!record.canonicalKey) {
       record.canonicalKey = await canonicalKeyFromSavedMetadata(db, row.favorite_title);
       if (record.canonicalKey) {
-        await db.execute("UPDATE reading_progress SET canonical_key = ? WHERE user_id = ? AND source = ? AND manga_id = ?", [
-          record.canonicalKey,
-          userId,
-          record.source,
-          record.mangaId
-        ]);
+        await db.execute(
+          "UPDATE reading_progress SET canonical_key = ?, updated_at = updated_at WHERE user_id = ? AND source = ? AND manga_id = ?",
+          [record.canonicalKey, userId, record.source, record.mangaId]
+        );
       }
     }
     const key = record.canonicalKey ?? (row.favorite_title ? titleFallbackKey(row.favorite_title) : undefined) ?? `${record.source}:${record.mangaId}`;
@@ -2108,6 +2580,8 @@ async function insertReadingProgress(db: Pool | PoolConnection, userId: string, 
   if (!progress.mangaId) throw new Error("Reading progress manga id is required.");
   if (!progress.chapterId) throw new Error("Reading progress chapter id is required.");
 
+  const chapterNumber = readableChapterNumber(progress.chapterNumber, progress.chapterId) ?? null;
+
   await db.execute(
     `
       INSERT INTO reading_progress (user_id, source, manga_id, canonical_key, chapter_source, chapter_id, chapter_number, scroll_position)
@@ -2132,7 +2606,7 @@ async function insertReadingProgress(db: Pool | PoolConnection, userId: string, 
       progress.canonicalKey ?? null,
       progress.chapterSource ?? progress.source,
       progress.chapterId,
-      progress.chapterNumber ?? null,
+      chapterNumber,
       progress.scrollPosition ?? null
     ]
   );
@@ -2184,11 +2658,23 @@ async function findRecommendationById(userId: string, id: string) {
     `
       SELECT
         recommendations.*,
+        COALESCE(
+          recommendations.cover_url,
+          favorites.cover_url,
+          JSON_UNQUOTE(JSON_EXTRACT(compiled_title_cache.detail_json, '$.coverUrl'))
+        ) AS cover_url,
         sender.username AS from_username,
         recipient.username AS to_username
       FROM recommendations
       INNER JOIN users sender ON sender.id = recommendations.from_user_id
       INNER JOIN users recipient ON recipient.id = recommendations.to_user_id
+      LEFT JOIN favorites
+        ON favorites.user_id = recommendations.from_user_id
+        AND favorites.source = recommendations.source
+        AND favorites.manga_id = recommendations.manga_id
+      LEFT JOIN compiled_title_cache
+        ON compiled_title_cache.source = recommendations.source
+        AND compiled_title_cache.manga_id = recommendations.manga_id
       WHERE recommendations.id = ? AND (recommendations.from_user_id = ? OR recommendations.to_user_id = ?)
       LIMIT 1
     `,
@@ -2249,11 +2735,28 @@ export async function listInboxRecommendations(userId: string) {
     `
       SELECT
         recommendations.*,
+        COALESCE(
+          recommendations.cover_url,
+          sender_favorites.cover_url,
+          recipient_favorites.cover_url,
+          JSON_UNQUOTE(JSON_EXTRACT(compiled_title_cache.detail_json, '$.coverUrl'))
+        ) AS cover_url,
         sender.username AS from_username,
         recipient.username AS to_username
       FROM recommendations
       INNER JOIN users sender ON sender.id = recommendations.from_user_id
       INNER JOIN users recipient ON recipient.id = recommendations.to_user_id
+      LEFT JOIN favorites sender_favorites
+        ON sender_favorites.user_id = recommendations.from_user_id
+        AND sender_favorites.source = recommendations.source
+        AND sender_favorites.manga_id = recommendations.manga_id
+      LEFT JOIN favorites recipient_favorites
+        ON recipient_favorites.user_id = recommendations.to_user_id
+        AND recipient_favorites.source = recommendations.source
+        AND recipient_favorites.manga_id = recommendations.manga_id
+      LEFT JOIN compiled_title_cache
+        ON compiled_title_cache.source = recommendations.source
+        AND compiled_title_cache.manga_id = recommendations.manga_id
       WHERE recommendations.to_user_id = ?
       ORDER BY recommendations.created_at DESC
     `,
@@ -2269,11 +2772,28 @@ export async function listOutboxRecommendations(userId: string) {
     `
       SELECT
         recommendations.*,
+        COALESCE(
+          recommendations.cover_url,
+          sender_favorites.cover_url,
+          recipient_favorites.cover_url,
+          JSON_UNQUOTE(JSON_EXTRACT(compiled_title_cache.detail_json, '$.coverUrl'))
+        ) AS cover_url,
         sender.username AS from_username,
         recipient.username AS to_username
       FROM recommendations
       INNER JOIN users sender ON sender.id = recommendations.from_user_id
       INNER JOIN users recipient ON recipient.id = recommendations.to_user_id
+      LEFT JOIN favorites sender_favorites
+        ON sender_favorites.user_id = recommendations.from_user_id
+        AND sender_favorites.source = recommendations.source
+        AND sender_favorites.manga_id = recommendations.manga_id
+      LEFT JOIN favorites recipient_favorites
+        ON recipient_favorites.user_id = recommendations.to_user_id
+        AND recipient_favorites.source = recommendations.source
+        AND recipient_favorites.manga_id = recommendations.manga_id
+      LEFT JOIN compiled_title_cache
+        ON compiled_title_cache.source = recommendations.source
+        AND compiled_title_cache.manga_id = recommendations.manga_id
       WHERE recommendations.from_user_id = ?
       ORDER BY recommendations.created_at DESC
     `,
